@@ -1,0 +1,1098 @@
+# Historial de cambios — Escuela de la Riqueza
+
+> Cambios ordenados cronológicamente del más viejo al más nuevo.
+> Para el estado actual del proyecto, ver `docs/PROJECT_STATE.md`.
+
+---
+
+## 2026-10-13
+
+### Grabaciones — `configure-live-input.mjs` ya no baja el timeout desplegado
+- El default de `timeoutSeconds` del script pasa de 60 a **300**, el valor de producción desde el 2026-09-19 (verificado por API el 2026-10-10). Con 60, correrlo sin argumentos bajaba el input y un Stop/Start de OBS volvía a partir la clase en varias grabaciones.
+- `RECORDINGS_ARCHITECTURE.md` todavía documentaba 60 como el valor vigente: corregido a 300, con la historia del cambio y el tradeoff real (~5 min hasta finalizar la grabación). `PENDIENTES.md` y `OBS_CONFIGURACION.md` alineados.
+- No se corrió el script ni se tocó Cloudflare.
+
+### Lives — reproductor: saltos de ±10 s y correcciones de documentación de la transmisión
+Revisión del commit 090a46a (saltos de 10 s en Clase completa) y de las guías de transmisión frente a las mediciones del 2026-10-10.
+- **Retomar posición con saltos de 10 s**: el botón y la flecha izquierda retroceden exactamente 10 s, y el umbral de "retroceso deliberado" exigía más de 10 s por salto, así que ninguna serie de saltos lo activaba y la posición nunca se guardaba. `LiveHLSPlayer` ahora acumula los retrocesos seguidos contra la posición de la que partió la serie (la serie termina tras 5 s reproducidos o con un avance); un solo salto de 10 s sigue sin contar y volver al vivo apaga la marca.
+- **Adelantar +10 s ya no cae en el filo exacto**: `seekBy` hacia adelante no pasa de la posición de sync del vivo (`liveSyncPosition`, con el respaldo de 6 s sobre el filo); si el salto la rebasaría se comporta como "Volver al vivo" (`goLive`, que ahora comparte el cálculo del destino), y si ya se está en ella o más allá no se mueve. Antes podía dejar el buffer en cero.
+- **Atajos con el menú de ajustes abierto**: se ignoran los eventos de teclado cuyo destino está dentro de `[role="menu"]` (antes solo se excluía Espacio sobre un ítem).
+- **Tests**: seis saltos de −10 s guardan la posición, uno solo no; `seekBy` +10 s cerca y lejos del filo; atajos con el menú abierto (estos fallan con el código anterior). Cobertura nueva de `preferences.store` (default `dvr`, valor guardado inválido cae al default, `smooth` guardado se respeta) y de `usePendingClass` (umbral de 45 s, solo en `dvr`). Se corrigió una palabra en voseo en un comentario de `ConfirmDialog.tsx`.
+- **Documentación corregida con datos verificados el 2026-10-10** (API de Cloudflare y mediciones del player): la entrada de las tres grabaciones del vivo fue 1280×720 y el nivel más alto entregado fue 720p, por lo que el techo de resolución es la salida de OBS (subir a 8000/10.000 kbps sin pasar a 1080p rinde poco; el ensayo ahora exige antes configurar la salida en 1080p); `recording.timeoutSeconds` desplegado es 300 (no el 60 del script); el perfil de OBS activo enviaba segmentos de 8,33 s (keyframe en automático, no los 2 s de la guía). Ajustados `OBS_CONFIGURACION.md` §1 y §5, `PENDIENTES.md` §8, `PROJECT_STATE.md`, `LIVE_STABILITY_PLAN.md` (la guía ya exige keyframe 2 s) y `CLAUDE.md` §7.4 (Clase completa es el default; su latencia depende de la duración del segmento: ~6-14 s con 2 s y 25-39 s con 8,33 s; clave de retomo `live-position:<live.id>:<starts_at>`). Sigue sin probarse una salida de 1080p.
+
+### Lives — reproductor: retroceso en Clase completa, Fluidez con segmentos largos y retomar posición
+Tres fallos medidos en producción el 2026-10-10 durante un vivo real (OBS enviaba segmentos de ~8,33 s por keyframe automático; con la configuración documentada son de 2 s).
+- **Pantalla negra al retroceder**: tras retroceder en "Clase completa" (p. ej. 10 min), el watchdog de estancamiento solo contaba avance si `currentTime` subía. Recargaba el manifest cada 12 s y a los ~2 min mostraba "Error de reproducción" encima de un video que se reproducía. El avance ahora se mide en ambos sentidos y se reinicia en `seeking`/`seeked`; un estancamiento real sigue recargando a los 12 s.
+- **Fluidez**: pasa de `liveSyncDuration: 8` / `liveMaxLatencyDuration: 20` (segundos) a `liveSyncDurationCount: 3` / `liveMaxLatencyDurationCount: 7` (segmentos). Con segmentos de 8 s el player quedaba a menos de un segmento del filo y tenía 1-4 `waiting` por minuto ("Clase completa", a 3 segmentos, tuvo 0 en 50 min). Los umbrales de "Volver al vivo" (`LivePlayerControls`) se calculan con la distancia real que informa hls.js.
+- **Clase completa — retomar**: la posición solo se guarda tras un retroceso deliberado (>10 s) y se borra al volver al vivo. Antes se guardaba también con la latencia natural (25-39 s con segmentos largos) y al reingresar retomaba hasta 44 min atrás.
+- Tests: 5 de los nuevos fallan con el código anterior y pasan con el arreglo.
+
+### Grabaciones — una clase partida ya no puede perder ni pisar grabaciones
+Incidente 2026-10-10: el vivo se partió en 4 grabaciones (OBS detenido e iniciado dos veces). El Worker archivó en R2 y borró de Stream la parte 1 **mientras la clase seguía en vivo**, y como la clave de R2 era una sola por sala, archivar otra parte habría sobrescrito la única copia. Ese mismo día una grabación de prueba quedó vinculada a una sala ya archivada del 2026-10-03. La clase se recuperó a mano (unión de partes en R2; ver `docs/RECORDINGS_ARCHITECTURE.md`).
+- **Worker**: solo archiva salas con `status = 'ended'`; el botón manual "Archivar en R2" responde 409 si la sala no terminó, y el workflow de grabaciones largas verifica lo mismo.
+- **Clave de R2 única por video**: `recordings/<liveId>/<streamVideoUid>.mp4` (Worker y Action idénticos, `worker/src/archive-helpers.ts`). Antes de subir se hace HEAD: si la clave existe no se sobrescribe ni se borra de Stream. Las filas viejas conservan `recordings/<liveId>.mp4`; `recording-url.ts` lee la clave de la base.
+- **Webhook `video.ready`**: ya no vincula grabaciones a salas archivadas y elige la sala por tiempo (creación de la grabación ≥ `starts_at` − 60 min; gana la más reciente). Lógica pura en `api/_lib/recordingTarget.ts`, con tests.
+- **Deploy**: merge a master (webhook y Action) y luego `wrangler deploy` desde `worker/`.
+- **Pendiente conocido**: las partes 2+ de una clase partida siguen sin vincularse ni archivarse solas; hay que unirlas a mano. El webhook ahora deja un `console.warn` (videoUid, liveInputId, fecha, motivo) cuando un `video.ready` no se vincula, para verlo en los logs de Vercel.
+
+### Grabaciones y reproductor — endurecimiento tras la revisión previa al push
+- **Worker, reintento idempotente**: si una pasada ya subió el MP4 a R2 pero no llegó a registrar la base, la siguiente retoma el registro y el borrado en Stream cuando el tamaño coincide; si difiere o es desconocido, rechaza sin sobrescribir ni borrar. Sin esto, la protección "nunca sobrescribir" convertía una falla parcial en una traba permanente. HEAD antes de abrir la descarga, escritura condicional de R2 (`onlyIf`) y orden determinista en la consulta de pendientes.
+- **Antes de borrar de Stream** (Worker y workflow): el registro en la base es condicional al `recording_stream_uid` de ese video y exige exactamente 1 fila afectada.
+- **Workflow `archive-long-recording`**: valida `live_id` (UUID) y `video_uid` (32 hex), pasa los outputs por `env:` y solo trata un 404 como "ausente" en R2 (antes cualquier error de credenciales o red contaba como ausente).
+- **Botón manual de archivado**: si Supabase no responde devuelve 502 en vez de un 409 engañoso.
+- **Reproductor**: el watchdog solo se reinicia con saltos de más de 1 s, así los seeks internos de hls.js no ocultan un estancamiento real. La distancia natural al vivo de `LivePlayerControls` vuelve a 0 sin muestra válida, con tests de los umbrales de "Volver al vivo".
+
+### Lives y comunidad — Clase completa por defecto, continuidad al finalizar y comunidad en claro/oscuro
+Implementa lo documentado más abajo, salvo el ensayo de bitrate (queda solo documentado, a pedido). Verificado con typecheck y tests (498/498); **sin prueba en un vivo real ni en dispositivos, y sin revisión visual con sesión** (la comunidad y la sala VIP piden login).
+- **Default**: `liveLatencyMode` arranca en `dvr` solo para quien no tiene valor guardado; `merge` conserva cualquier modo persistido y descarta valores inválidos. Un `smooth` guardado no se distingue de uno heredado: no se migra a escondidas.
+- **Continuidad al finalizar (P0)**: si el alumno iba >45 s atrás en Clase completa (`usePendingClass`, muestreo cada 2 s), al pasar la sala a `ended` el player sigue montado (`withEndedContinuation`) con aviso «La clase terminó · Sigues viendo lo que te faltaba» y «Salir». Con `streamEnded` el player no recarga el manifest (con Input ID traería otra emisión o un 204): un estancamiento o el fin del medio pasan al cierre. Entrar a una sala ya finalizada no continúa nada.
+- **Reproductor**: `goLive()` es la única operación de "volver al vivo" (barra y aviso de retomar), reanuda y respeta la pausa de sala; `MANIFEST_PARSED` y Safari nativo ya no reproducen bajo el overlay de pausa; `seekTo`/`seekBy` buscan en intervalos reales de `seekable` (`clampToSeekable`); el atraso y la timeline se actualizan en pausa; los listeners de la barra se reenganchan tras «Reintentar» (`mediaKey`); el menú se portalea dentro del contenedor en pantalla completa; resume por emisión (`live.id:starts_at`).
+- **Controles**: menú «Modo de clase» (Clase completa / Clase normal · Fluidez / Baja latencia) con aviso al cambiar; ±10 s en Clase completa; atajos con foco en el reproductor (Espacio/K, M, F, flechas); atraso exacto (`−1:35`); `aria-valuetext` legible en la barra; Escape cancela el arrastre; «Ver en Clase normal» en el error si DVR falla.
+- **Comunidad**: `fetchPosts`/`fetchComments`/`fetchPost` lanzan ante un error (antes devolvían vacío = "nadie publicó"); feed con error/reintento, vacío por filtro, refresco sin skeleton, respuestas viejas descartadas y scroll restaurado al volver del detalle; métricas «Autores en esta vista» con alcance visible; «Crear publicación»; publicar bloqueado mientras sube la imagen; validación en línea con foco; texto conservado si falla; categoría como radiogroup; menú de tarjeta con Radix; título como botón (teclado); `ConfirmDialog` con tema en vez de `confirm()`; eliminar visible sin hover; `AuthorAvatar` común (el escudo admin tenía aro `ring-darker` negro en claro); merge de comentarios sin duplicar ni perder el propio.
+- **Revisión visual con sesión real (comunidad, ambos temas, 668 px)**: el escudo admin quedaba suelto al pie de la tarjeta (el contenedor del avatar se estiraba en la fila flex; `self-start`); `ConfirmDialog` no devolvía el foco al botón que lo abrió (se abre sin `DialogTrigger`; ahora recuerda el elemento enfocado). Menú de tarjeta con teclado, validación en línea y confirmación verificados sin escribir datos. Los errores de consola «Invalid prop `ref` supplied to `React.Fragment`» vienen de la carga inicial del dashboard, no de la comunidad (montar feed y detalle da 0).
+- **Abrir una publicación caía en el footer** (reportado por Johan): el detalle reemplaza al feed pero el scroll quedaba donde estaba la tarjeta. Ahora el título desliza al inicio de la publicación y el botón de comentarios corta al inicio y desliza hasta los comentarios cuando cargan (un solo movimiento). Todo pasa por `scrollToElement`/`scrollToY` de `lib/smoothScroll.ts`, que descuentan el header pegado y respetan Lenis: un `window.scrollTo` directo lo desincroniza, y Lenis recortaba el destino con la altura vieja de la página si no se llama `resize()` antes. Medido en 668 px (sin Lenis) y 1280 px (con Lenis): comentarios a 73 px del borde (header 65 px), volver al foro restaura la posición exacta.
+- **Barra del reproductor en celular** (medida con una página temporal y un player simulado, porque no había sala activa): con el atraso exacto, «AL VIVO»/«EN VIVO» se partían en dos renglones también en Clase normal → `whitespace-nowrap`. A 320 px, el −10 s se oculta bajo 360 px y el punto de la píldora también, para que entre un atraso de horas (`−1:10:00`). Sin desborde en 320/360/375 en todos los casos.
+- **Lint**: el error `react-hooks/immutability` de `video.volume = v` en `LivePlayerControls` ya estaba en `HEAD`; se dejó porque arreglarlo destapa 4 avisos viejos de `setState` en efectos de ese archivo.
+
+### Documentación — Clase completa, comunidad y calidad del streaming
+
+- Actualizada la auditoría de UX con una revisión del código actual: propuesta para Clase completa/DVR predeterminada, timeline, atraso visible, retomo, regreso al vivo y a Fluidez, continuidad al finalizar, compatibilidad móvil y criterios de aceptación. Se conserva la auditoría histórica con su baseline.
+- Documentados los requisitos de comunidad en claro/oscuro para feed, editor, detalle, comentarios, imágenes y estados; se diferencia el soporte de tema existente de las mejoras pendientes. Corregido el inventario de permisos: Free lee; Individual/VIP/admin escriben según el contrato del repositorio, sin certificar las policies desplegadas.
+- Revisada `OBS_CONFIGURACION.md`: 6000 kbps continúa como base documental; ensayo propuesto a 8000/10.000, con keyframe fijo, mediciones de ingesta/salida, red y reversión. Eliminada la afirmación no sustentada de máximo 720p; la resolución real exige inspeccionar el manifiesto de una emisión.
+- Fuentes oficiales de Cloudflare contrastadas: bitrate combinado 2–14 Mbps, recomendación habitual inferior a 10 Mbps, DVR opt-in y límites de sesiones largas/uso de Input ID. La configuración activa de OBS y del proveedor queda pendiente de verificación.
+- **Entrega exclusivamente documental:** modificados documentos existentes e inventario de pendientes. Sin cambios de aplicación, SQL, configuración o despliegue; sin build ni ejecución de tests. La experiencia renderizada y una transmisión real no se evaluaron en esta revisión.
+
+## 2026-10-09
+
+### Seguridad — cualquier usuario podía hacerse admin
+- **Hallazgo (verificado en Supabase)**: la policy «Users can update own profile» de `profiles` es `USING (auth.uid() = id)` sin restricción de columnas, y la tabla no tenía triggers. Cualquier usuario logueado podía hacer desde la consola `update({ role: "admin" })` sobre su propio perfil y quedar como admin (todas las policies de admin confían en `profiles.role`), regalarse `plan = 'vip'` o quitarse una suspensión.
+- **Fix**: `sql/migrate-profiles-protect-privileged-columns.sql`. Trigger `BEFORE INSERT OR UPDATE` que, cuando la escritura viene directo del cliente (`current_user` = `authenticated`/`anon`), rechaza cambios en `role`, `plan`, `is_suspended` y `email`, y fuerza valores por defecto en un INSERT. Las RPC del admin y los triggers de registro y de email son `SECURITY DEFINER` (verificado: `admin_toggle_suspend`, `admin_delete_user`, `admin_update_user_plan`, `handle_new_user`, `handle_user_update`), así que siguen funcionando. El alumno sigue pudiendo editar `full_name` y `avatar_url`.
+- **Verificado en Supabase**: simulando un alumno, `update profiles set role = 'admin'` falla con `42501`. Suspender, cambiar plan y editar nombre/foto siguen funcionando.
+
+### Seguridad — el email de todos los usuarios era legible sin iniciar sesión
+- **Hallazgo**: la policy SELECT «Profiles are viewable by everyone» (`true`, aplicada a `public`) dejaba a cualquiera con la anon key leer el email de todos los usuarios.
+- **Fix por columna, no por fila**: restringir filas rompía los nombres del chat, los autores de la comunidad (que muestran `role`/`plan` como badge a propósito) y la policy de admin sobre `profiles` (recursión). Solo `email` deja de ser legible para `anon`/`authenticated`.
+  - `sql/migrate-profiles-admin-user-rpcs.sql`: `admin_list_users()` y `admin_get_user(uuid)`, `SECURITY DEFINER`, solo admin, devuelven el email.
+  - `sql/migrate-profiles-hide-email.sql`: revoca el SELECT de la tabla y lo concede solo en las columnas sin email.
+  - Frontend: `auth.ts` usa `PROFILE_COLUMNS` explícitas (el email propio sale de la sesión de Supabase Auth) y `admin/users.ts` lee por las RPC.
+- **⚠️ Orden de despliegue obligatorio**: SQL fase 1 → deploy del frontend → SQL fase 2. La fase 2 antes del deploy rompe el login con el frontend viejo (`select("*")` → «permission denied for column email»).
+
+### Lives — vista previa y moderación del chat para el admin
+- **⚠️ Correr `sql/migrate-live-messages-admin-delete.sql` en Supabase ANTES (o junto con) el deploy del frontend.** Es re-ejecutable. Agrega la policy `DELETE` de `live_messages` solo para admins (antes no existía: nadie podía borrar mensajes) y verifica que la tabla esté en la publicación `supabase_realtime`. Las reacciones caen por `ON DELETE CASCADE` y las respuestas quedan como «Mensaje eliminado» por el `ON DELETE SET NULL` + trigger existente.
+- **Panel de Eventos en Vivo**: nueva tarjeta «Vista previa y chat» (`src/components/feature/admin-live/`) con el video (`LiveHLSPlayer`, modo Fluidez) y el chat de la sala. Usa el sondeo de OBS existente (`obsConnected`). Arranca siempre en silencio (el audio con ~8 s de retraso se cuela en el micrófono de OBS). Si OBS está conectado y el video no empieza en ~20 s, muestra un aviso con «Reintentar». Plegar la tarjeta desmonta player y chat.
+- **Moderar el chat (solo eliminar mensajes)**: `LiveChat` acepta `canModerate`; con rol admin muestra «Eliminar mensaje» con confirmación, de forma optimista con reversión. La autoridad real es la policy RLS; `deleteLiveMessage` trata 0 filas borradas como fallo porque con RLS un DELETE bloqueado no devuelve error.
+- **Borrado en tiempo real**: `LiveChat` escucha `DELETE` de `live_messages` (sin filtro por sala, como `useLiveReactions`) y aplica `removeMessage`. El chat público usa `reconcileWindowedMessages` para que lo borrado desaparezca en el siguiente sondeo sin perder mensajes más viejos que la ventana.
+
+### Lives — panel de transmisión unificado en el admin
+- **Panel de transmisión** (`AdminBroadcastPanel`, `BroadcastControls`): vista previa, chat moderable y controles (estado, OBS, audio, pausar/reanudar, finalizar) en un solo bloque sobre el editor. Reemplaza la tarjeta «Control de Transmisión» y la de «Vista previa y chat». Plegado, los controles siguen visibles. Sala programada: panel compacto con «Iniciar transmisión».
+- **Fix**: la vista previa también se monta con la sala en estado `live` aunque el sondeo de OBS esté apagado (en `npm run dev`) o caído. En esos casos el indicador muestra «Estado de OBS no disponible» en lugar de «Sin señal».
+- **Pausa**: la vista previa muestra el mismo aviso que ven los alumnos («En pausa — así lo ven los alumnos») y ofrece «Ver señal de OBS» para revisar la escena sin reanudar. La vista se restablece al reanudar o pausar de nuevo. Recordatorio: «Pausar» solo tapa la pantalla del alumno; OBS y Cloudflare siguen transmitiendo y grabando.
+- **Espectadores**: contador «N viendo» con la lista de registrados y «+K invitados». `useLivePresence` acepta `observeOnly`, así el admin escucha la presencia sin contarse.
+- **Modo de latencia de la vista previa**: el admin puede elegir Fluidez, Baja latencia o Clase completa para ver lo mismo que un alumno con ese modo. Es un estado local del panel: no altera la preferencia del alumno ni guarda posición de reproducción.
+
+### Lives — borrados del chat más robustos (hallazgos de la revisión previa al push)
+- **LiveChat**: los mensajes eliminados ya no reaparecen. Sus ids se guardan como eliminados (`useLiveMessageDeletions`, `excludeDeleted`) y se filtran en un INSERT que llega tarde, en la carga del historial y en la resincronización. Al reconectar Realtime se vuelven a pedir los últimos 200 mensajes y se concilian con `reconcileWindowedMessages`: se quita lo borrado durante la caída y se suma lo que se perdió.
+- **Moderación**: `deleteLiveMessage` distingue «ya estaba eliminado» (otro admin o doble clic: éxito, sin restaurar) de un rechazo real (`MessageDeleteRefusedError`: se revierte y se avisa).
+- **PublicLiveChat**: se descarta una respuesta de sondeo más vieja que la última aplicada, así no desaparecen mensajes recién llegados. La ventana de mensajes queda acotada al tope de 200 de la RPC.
+- **LiveHLSPlayer**: el contador de errores de media también se reinicia tras 15 s de reproducción estable (antes, desde el tercer error espaciado ya no se intentaba `recoverMediaError()`).
+
+## 2026-10-03
+
+### Lives — "Error de reproducción" encima de un vivo que seguía sonando
+- **Síntoma**: a mitad de la clase aparecía el cartel "Error de reproducción" mientras el audio seguía reproduciéndose. El monitor no registró ningún corte en Cloudflare.
+- **Causa 1**: `LiveHLSPlayer` permite 6 recargas por montaje y vuelve el contador a 0 tras 15 s de reproducción estable, pero **cualquier** error de hls.js (incluso los no fatales que se recuperan solos, constantes en un vivo largo) cortaba esa ventana. El contador acumulaba recargas espaciadas de toda la clase hasta llamar a `onFatalError`.
+- **Causa 2**: una vez en `playerError`, nada lo quitaba aunque el video volviera a avanzar. Solo "Reintentar" lo hacía.
+- **Fix**: solo los errores **fatales** cortan la ventana de estabilidad. Nuevo `onRecovered`: si tras `onFatalError` el video avanza 5 s seguidos, se reinician los contadores y `useLivePlayback` quita el cartel. Dos tests nuevos en `LiveHLSPlayer.test.tsx`, verificados en rojo contra el código anterior.
+
+### Lives — clase sin video: Cloudflare rechazaba los fragmentos de OBS
+- **Síntoma**: los alumnos veían "Error de reproducción" o el reproductor cargando sin fin. Cloudflare mostraba el Live Input "Connected" con 10,8 Mbit/s de entrada y "GOP: Unavailable".
+- **Causa (verificada pidiendo los fragmentos)**: Cloudflare respondía `413 segment size exceeds 10MB: 11013050 bytes`. OBS tenía el intervalo de keyframes en automático (fragmentos de 8,333 s = 250 cuadros a 30 fps), y a 10,8 Mbit/s cada fragmento pesaba ~11 MB. Siempre había estado en automático: antes funcionaba porque la tasa de bits quedaba por debajo de ~9,6 Mbit/s (probablemente control de tasa variable, que sube con movimiento o poca luz).
+- **Solución**: configuración de OBS documentada en `docs/OBS_CONFIGURACION.md` (CBR 6000 kbps, keyframe 2 s, B-frames 0). No hubo cambios de código.
+- **Otros aprendizajes del día**: al principio el manifiesto respondía `204` (OBS todavía no entregaba video). Además, finalizar la sala y crear una nueva cambió el link público y dejó afuera a quienes tenían el original; corresponde **Reactivar** la sala existente.
+- **Corrección en `CLAUDE.md`**: la clave de OBS es la RTMPS Key del Live Input, no el Input ID.
+
+## 2026-09-28
+
+### Lives — no se podía eliminar una sala con respuestas en el chat
+- **Síntoma**: eliminar una sala en "Finalizados" fallaba con `27000 tuple to be updated was already modified by an operation triggered by the current command` (400 en `DELETE /lives`).
+- **Causa**: el trigger `BEFORE DELETE` de `migrate-live-message-replies.sql` limpiaba el extracto de las respuestas con un `UPDATE`. Al borrar una sala, `lives → live_messages` borra en cascada, así que el trigger modificaba respuestas que ese mismo comando estaba por borrar, y Postgres abortaba todo. Con mensajes sueltos no pasaba.
+- **Fix**: se eliminó ese trigger. La limpieza pasó al caso (d) del trigger de derivación, que se dispara cuando la FK `ON DELETE SET NULL` anula `reply_to_id`: borra el extracto y conserva el autor ("Mensaje eliminado" sigue igual). **⚠️ Volver a correr `sql/migrate-live-message-replies.sql` en Supabase** (es re-ejecutable y hace `DROP` del trigger viejo).
+- **Verificado contra Postgres real** (PGlite, esquema mínimo): con el SQL viejo se reproduce el `27000`; con el nuevo aplicado encima, la sala se elimina con sus mensajes, y siguen funcionando el bloqueo de citas falsas, la degradación de respuestas a otra sala y "Mensaje eliminado".
+- **`AdminLiveManager`**: `handleDelete` ahora también saca la sala de `endedLives` (antes seguía visible en "Finalizados" hasta recargar) y muestra un toast de error si el borrado falla (antes solo iba a la consola).
+
+## 2026-09-27
+
+### Login — sin partículas de fondo en celular
+- **Síntoma**: en iPhone, al pasar de un vivo público a `/login?returnTo=...`, Safari mostró "Ocurrió un problema varias veces" (la pestaña se cerró varias veces seguidas, típicamente por falta de memoria). Al recargar, funcionó.
+- **Hipótesis (no confirmada con el inspector de Safari)**: `ParticleNetwork` redibuja un canvas a pantalla completa en cada frame (comparación O(n²) + `shadowBlur`) y arrancaba mientras iOS todavía no había liberado la memoria del video del vivo. Se descartaron un bucle de redirección `returnTo` y efectos al escribir el correo.
+- **Cambio**: `AuthBackground` monta `ParticleNetwork` solo con `useIsDesktop()` (≥768px). La landing (`HeroCinematic`) no se tocó.
+
+### Live — chat en celular: burbujas cortadas y picker fuera de la vista
+- **Palabras partidas en las burbujas ("Excelen te")**: la fila que envuelve la burbuja se ajusta a su contenido (el padre usa `items-start/end`), y la burbuja tenía `max-w-[90%]` de esa fila, es decir, el 90% de su propio texto. El límite pasó a la fila, donde el 90% es del ancho del chat. Venía de cuando las reacciones metieron la fila alrededor de la burbuja.
+- **Picker de reacciones fuera de la vista en el último mensaje**: se abre debajo de la burbuja y en celular quedaba cortado. Ahora la lista se desplaza lo mínimo para mostrarlo.
+- **`scrollWithinList`** (`src/lib/chat/`): desplaza solo la lista del chat. Reemplaza el `scrollIntoView` de "Ir al mensaje original" (en `LiveChat` y `PublicLiveChat`), que en celular arrastraba también la página y el video (misma razón que en `useChatScroll`, F19).
+- **Botón ✕ de "Respondiendo a…"**: el área táctil pasa de 32px a 44px.
+
+### Live — responder a un mensaje del chat (estilo WhatsApp)
+- **⚠️ Correr `sql/migrate-live-message-replies.sql` en Supabase ANTES de deployar el frontend.** El frontend viejo sigue funcionando sin cambios contra la nueva firma de `get_public_live_messages` (ignora las 3 columnas nuevas), así que no hay ventana rota entre los dos deploys.
+- **Columnas nuevas en `live_messages`**: `reply_to_id` (FK a `live_messages(id) ON DELETE SET NULL`), `reply_to_user_id`, `reply_to_user_name`, `reply_to_excerpt`. El cliente solo manda `reply_to_id` al insertar — el nombre y el extracto los deriva un trigger `BEFORE INSERT`/`BEFORE UPDATE OF ...` (`SECURITY DEFINER`) a partir de la fila real del mensaje original, nunca de lo que mande el cliente (si no, cualquiera podría "citar" algo que Iván nunca dijo).
+- **Moderación (mensaje original borrado)**: un trigger `BEFORE DELETE` limpia `reply_to_excerpt` de todas las respuestas antes de que el FK ponga `reply_to_id` en null. `reply_to_user_name` se conserva a propósito (el trigger de derivación lo reafirma en ese caso) — así la UI puede seguir mostrando "Respondiendo a {nombre}" con "Mensaje eliminado" en vez del extracto, en lugar de perder la atribución.
+- **`get_public_live_messages`**: gana `reply_to_id`, `reply_to_user_name`, `reply_to_excerpt` (no expone `reply_to_user_id` — el link público anónimo no tiene sesión con la que compararlo).
+- **UI**: `QuotedMessage` (cita dentro de la burbuja, clickeable como "Ir al mensaje original" solo si el original sigue cargado — si no, es un `div` no interactivo) y `ReplyComposerPreview` (barra "Respondiendo a {nombre}" sobre el input, con X y Escape para cancelar) nuevos en `src/components/feature/chat/`. `ReactionPicker` pasó a ser una pequeña barra de acciones: los 4 emojis + separador + botón "Responder" (ícono `Reply` de lucide). En `LiveChat` se puede responder desde esa barra (mobile) o con un botón de hover junto al de `SmilePlus` (desktop); un envío fallido conserva el objetivo de respuesta, uno confirmado lo limpia. La burbuja de quien recibió una respuesta lleva un anillo sutil. `PublicLiveChat` renderiza la misma cita en modo lectura (sin acciones — anon no puede responder).
+- Estado de UI nuevo: hook `useReplyTarget` (mensaje en curso de respuesta) en `src/hooks/`, tipos `ReplyTo`/`ReplyTarget` en `src/lib/chat/replyTo.ts`.
+- Tests: `QuotedMessage.test.tsx` y `ReplyComposerPreview.test.tsx` nuevos; casos nuevos en `LiveChat.test.tsx` (responder desde la barra de acciones, payload sin `reply_to_user_name`/`excerpt`, cancelar con X/Escape, un envío fallido conserva la respuesta, cita desde Realtime, "Mensaje eliminado", anillo de "te respondieron", salto+resalte al original) y en `PublicLiveChat.test.tsx` (cita en modo lectura, con y sin original cargado).
+
+## 2026-09-26
+
+### Live — reacciones a los mensajes del chat
+- **Pedido del cliente**: 4 reacciones exactas — ❤️ (`heart`), 🔥 (`fire`), 👏 (`clap`), 🙌 (`raised_hands`). Un usuario puede poner cada una como máximo una vez por mensaje y la saca tocándola de nuevo. Objetivo además del engagement: que Iván vea de un vistazo qué mensajes/preguntas resuenan.
+- **SQL a correr**: `sql/migrate-live-message-reactions.sql` (nueva tabla `live_message_reactions`, RLS, alta a `supabase_realtime`, función `get_public_live_reactions` para el link público).
+- **Modelo de seguridad**: una fila por `(message_id, user_id, emoji)` (PK compuesta — el propio esquema impide reaccionar dos veces con el mismo emoji). RLS: SELECT abierto a autenticados (misma visibilidad que `live_messages`), INSERT valida `user_id = auth.uid()` **y** que `message_id` pertenezca al `live_id` declarado (evita spoofear `live_id`), DELETE solo la propia. El link público lee conteos agregados vía `get_public_live_reactions` (SECURITY DEFINER, token-gated) — nunca ve quién reaccionó.
+- **Realtime**: mismo canal `live_messages_${liveId}` que ya usaba `LiveChat` (sin abrir una suscripción nueva). Verificado en la doc de Supabase ("Postgres Changes"): un DELETE solo se puede filtrar por columna con `replica identity full`, que no activamos; por eso el DELETE llega sin filtrar por `live_id` y el `old` trae únicamente las columnas de la primary key (`message_id, user_id, emoji`, suficiente para actualizar el mapa local). El INSERT sí se filtra por `live_id=eq.${liveId}`.
+- **UI**: `MessageReactions` (chips con contador, solo si count > 0) y `ReactionPicker` (barra de 4 emojis, se cierra con click afuera o Escape) en `src/components/feature/chat/`. En `LiveChat` se abre tocando la burbuja (funciona en touch y desktop) o con un botón que aparece al pasar el mouse/foco en desktop; toggle optimista con rollback + toast de error si falla. `PublicLiveChat` muestra los mismos chips en modo solo lectura, con el mismo polling de 4 s que los mensajes.
+- Tests: `reactions.test.ts` (helpers puros + capa de datos), nuevos casos en `LiveChat.test.tsx`, `PublicLiveChat.test.tsx` nuevo.
+
+### Live — reacciones: extracción del hook `useLiveReactions` + 2 fixes de UI (resync tras reconexión, picker que se reabría)
+- **Refactor (A)**: todo el estado de reacciones de `LiveChat` (snapshot, buffer de eventos de Realtime, toggle optimista con rollback, `pendingKeysForMessage`) se movió a `src/hooks/useLiveReactions.ts`. El hook abre su PROPIO canal de Realtime (`live_reactions_${liveId}`), separado del canal de mensajes — antes ambos vivían encadenados en un mismo `channel.on(...).on(...).on(...)`. `LiveChat` le pasa `messageIds` (ids de los mensajes no-sistema que tiene cargados, recalculado en cada render) y `historyReady` (true una vez que el historial terminó de cargar, éxito o error); el hook lee `messageIds` por ref para que un resync más adelante use la ventana más actual, no la del historial inicial.
+- **Fix 3 — reconexión perdía eventos**: si el canal de reacciones caía y volvía a `SUBSCRIBED` (Realtime reconecta solo), los eventos durante la caída no se recuperaban. Ahora cada `SUBSCRIBED` posterior al primero dispara un resync completo del snapshot (mismo mecanismo de buffer+merge que la carga inicial). Si dos resyncs se solapan, gana el más nuevo por token — el resultado desactualizado se descarta en vez de pisar al reciente.
+- **Fix 4 — el picker se reabría solo**: un tap real dispara `pointerdown` antes que `click`. El `pointerdown` "afuera" que usa `ReactionPicker` para cerrarse ya lo cerraba, y el `click` posterior (sobre la burbuja o el botón `SmilePlus`) volvía a abrirlo por el toggle de `openPickerId`. Ambos triggers ahora llevan `data-reaction-trigger`, y el handler de `pointerdown` de `ReactionPicker` ignora los targets dentro de `[data-reaction-trigger]` — el `click` del propio trigger decide.
+- **D**: `PublicLiveChat` usa la constante `SYSTEM_MESSAGE.id` en vez del string `"system-1"` repetido. La burbuja de mensaje de `LiveChat` (único camino táctil al picker en celular) ahora es `role="button"` + `tabIndex={0}` + `aria-label="Reaccionar a este mensaje"` + Enter/Espacio, pero solo cuando es realmente interactiva (mensaje no-sistema y con sesión); si no, sigue siendo un `div` sin más.
+- `LiveChat.tsx` bajó de 570 a 456 líneas.
+- Tests: `useLiveReactions.test.ts` nuevo (snapshot inicial, buffer durante carga, no resync en la primera suscripción, resync tras reconexión, rollback optimista). `LiveChat.test.tsx` separa el canal de mensajes del de reacciones en el mock (`supabase.channel` devuelve uno u otro según el nombre) y suma un caso para el fix del picker. `reactions.test.ts` suma casos de `pendingKeysForMessage`.
+
+### Live — reacciones: dos fixes sobre lo de arriba (race de carga + ventana de mensajes)
+- **⚠️ Antes de deployar el frontend hay que volver a correr `sql/migrate-live-message-reactions.sql` en Supabase.** La función `get_public_live_reactions` cambió de firma (ahora recibe `p_limit`) y el frontend ya manda ese parámetro — sin la migración aplicada, el RPC del link público falla.
+- **Fix 1 — snapshot pisaba eventos de Realtime concurrentes**: en `LiveChat`, el snapshot inicial de reacciones (`fetchLiveReactions`) se pedía DESPUÉS de suscribirse al canal, pero cualquier INSERT/DELETE que llegara entre el snapshot y el `setReactions(...)` se perdía (el snapshot lo reemplazaba entero). Mismo problema que F20 ya resolvió para los mensajes, ahora para reacciones. Nuevo helper puro `mergeReactionSnapshot` en `reactions.ts`: mientras el snapshot no resuelve, los eventos de Realtime se guardan en un buffer local del efecto y se repiten (como set/unset idempotente por `message_id:user_id:emoji`) sobre las filas del snapshot al llegar la respuesta.
+- **Fix 2 — reacciones se pedían sin ventana**: `fetchLiveReactions` traía TODAS las reacciones del vivo aunque el historial de mensajes está limitado a `HISTORY_LIMIT = 200`. Ahora recibe `messageIds` y filtra con `.in("message_id", ...)` (sin query si la lista viene vacía). Mismo problema en el link público: `get_public_live_reactions` agregaba TODAS las reacciones del vivo aunque `get_public_live_messages` solo muestra los últimos `p_limit` mensajes; la función ahora acepta `p_limit` (default 100, mismo clamp `LEAST/GREATEST` que los mensajes) y solo agrega reacciones de esa ventana. Como cambia la firma, la migración hace `DROP FUNCTION IF EXISTS ... (text)` antes de crear la versión con `p_limit` (si no, un overload deja ambiguo un llamado de un solo argumento). `PublicLiveChat` comparte una sola constante (`MESSAGE_WINDOW`) entre el llamado a mensajes y a reacciones en vez de duplicar el número.
+- Tests: nuevos casos de `mergeReactionSnapshot` en `reactions.test.ts`, actualizados los de `fetchLiveReactions`/`fetchPublicLiveReactions` para las nuevas firmas, y un test de regresión en `LiveChat.test.tsx` que prueba que una reacción de Realtime llegada antes del snapshot sigue visible después de que resuelve.
+
+### Live — reacciones: extraído a `useLiveReactions`, canal propio, resync tras reconexión y fix del picker que se reabría
+- **Refactor container/presentational**: `LiveChat.tsx` ya no guarda estado de reacciones — todo (`reactions`, el toggle optimista con rollback + toast, el snapshot inicial y su buffer contra Realtime) se movió al hook `src/hooks/useLiveReactions.ts`. El hook abre su **propio** canal Realtime (`live_reactions_${liveId}`), separado del canal de mensajes de `LiveChat`; antes las reacciones viajaban encadenadas al mismo canal de mensajes.
+- **Resync tras reconexión**: si el canal de reacciones vuelve a `SUBSCRIBED` después de haber estado suscrito antes (una caída real, no el subscribe inicial), el hook vuelve a pedir el snapshot completo y lo mezcla con `mergeReactionSnapshot` — los eventos que se pudieran haber perdido durante el corte no quedan huérfanos. El primer `SUBSCRIBED` no dispara nada (esa carga la arranca el historial de mensajes). Un token por corrida descarta la respuesta de un snapshot viejo si una reconexión más nueva ya arrancó otro.
+- **Fix — el picker se reabría al tocarlo para cerrarlo**: `ReactionPicker` cierra con un `pointerdown` fuera de sí mismo, pero el mismo tap sobre la burbuja (o el botón `SmilePlus`) dispara primero `pointerdown` (cierra) y después `click` (vuelve a abrir sobre `null`). Ahora la burbuja y el botón llevan `data-reaction-trigger`, y el `pointerdown` de afuera ignora cualquier click dentro de un trigger — el que decide abrir/cerrar/cambiar de mensaje es el `click` del propio trigger.
+- **Accesibilidad**: la burbuja de mensaje (el único disparador del picker en celular) ahora es un `role="button"` con `tabIndex`, `aria-haspopup="menu"`, `aria-expanded` y Enter/Espacio cuando es interactiva (mensaje propio del usuario logueado, no system); un mensaje no interactivo no lleva ninguno de estos atributos.
+- **Detalle menor**: `PublicLiveChat` comparaba contra el string literal `"system-1"` en cuatro lugares; ahora usa `SYSTEM_MESSAGE.id`.
+- Tests: `useLiveReactions.test.ts` nuevo (snapshot inicial, buffer de Realtime durante la carga, rollback + toast, resync tras reconexión, sin resync en el primer `SUBSCRIBED`). `LiveChat.test.tsx` actualizado para el canal separado (dos mocks de canal, uno por nombre) más un caso nuevo del fix del picker.
+
+### Live — botón "Segundo plano" con texto y barra de controles que entra en celular
+- **Pedido**: el botón de ventana flotante era solo un ícono que nadie reconocía; los alumnos seguían reportando que el vivo "no funciona en segundo plano".
+- **Cambio**: el botón ahora dice **"Segundo plano"** (y "Volver" mientras está activo). En celular va con el ícono arriba y la etiqueta en dos líneas; desde `sm` en una sola línea.
+- **Bug previo encontrado al medir**: con el alumno atrasado, la pill "VOLVER AL VIVO -1:30" ya se partía en dos renglones en 320, 360 y 375 px — o sea, en la mayoría de los teléfonos — antes de este cambio. Ahora en celular dice **"AL VIVO"**; la frase completa se mantiene desde `sm` y en el `aria-label`.
+- **Medición** (réplica exacta del markup, peor caso atrasado + al vivo): 360/375/390 px sin texto partido ni desborde. 320 px (iPhone SE 1ra generación) sigue apretado — aceptado.
+- Tests: 2 nuevos en `LivePlayerControls.test.tsx`.
+
+- **Bug atrapado en revisión antes de salir**: al quitar tu propia reacción, la actualización inmediata + el eco de Realtime del mismo DELETE descontaban dos veces; con 2+ personas en el mismo emoji, eso borraba la reacción del OTRO espectador de todas las pantallas. `applyReactionRemoved` ahora ignora el eco de una baja propia ya aplicada (mismo criterio que el alta). Test de regresión que falla sin la guarda.
+- Chips de reacción: área táctil de ~44px con un pseudo-elemento invisible (se ven compactos).
+- Pendiente, no bloqueante: cada evento de reacción re-renderiza la lista de hasta 200 mensajes (extraer una fila memoizada si se nota con mucha gente); el chat público hace 2 consultas cada 4s por visitante (mensajes + reacciones) en vez de una.
+
+## 2026-09-25
+
+### Live — resto determinista de la auditoría UX (F05, F07, F08, F14, F17, F20, F23, F30, F31, F35, F38, F40, F43)
+- **Chat** (`LiveChat`):
+  - **F20**: el historial ya no **reemplaza** la lista, se mezcla por `id` (`mergeMessagesById`), así que un mensaje llegado por Realtime mientras cargaba el historial ya no se pierde. Los mensajes de Realtime se ordenan por `created_at`, no por orden de respuesta. Carga los **últimos 200** (DESC + reverse) en vez del historial completo. El mensaje de bienvenida pasa a `created_at` época 0 para quedar primero.
+  - **F38**: caché de nombres por suscripción, así que un mensaje de alguien que ya habló no consulta `profiles`. Antes era una consulta por mensaje en cada espectador.
+  - **F23**: el punto "Chat en tiempo real" refleja el estado real de la suscripción ("Conectando…" / "Reconectando…" en ámbar). Un historial que no cargó lo dice en lugar de mostrarse vacío. Filas tipadas (`MessageRow`): se van los dos `any`.
+- **Controles** (`LivePlayerControls`):
+  - **F05**: la barra no se oculta con el menú de ajustes abierto, con foco de teclado adentro (solo `:focus-visible`, para que un clic de mouse no la trabe visible) ni mientras se arrastra la línea de tiempo. Llegar con Tab al video la muestra.
+  - **F07**: botones de 44 px de área táctil (`size-11 -my-2`, sin engordar la barra). "Desmutear/Mutear" pasa a "Activar sonido/Silenciar" y "renditions" a "Sin otras calidades disponibles".
+  - **F08**: preferencia de calidad y calidad activa separadas (`currentLevel` / `activeLevel`): con Auto el selector muestra **"Auto · 720p"** en vez de parecer una elección manual. Reintentar el player vuelve la preferencia a Auto.
+  - **F43**: al filo, "EN VIVO" rojo con pulso; atrasado, **"VOLVER AL VIVO -12 s"** como acción, sin rojo ni pulso. Ya no depende de un `title`.
+- **Sala**:
+  - **F14**: intro de 2,5 s (antes 3,5), con **"Saltar"** o clic para cerrarla; no aparece con movimiento reducido ni con las animaciones apagadas. Sin `autoFocus`, para no robar el foco a quien escribe en el chat.
+  - **F17**: `LiveRoom` va con `key={live.id}`: otra sala arranca con estado nuevo (audio, calidad, no leídos, player).
+  - **F35**: pasada la hora sin señal, "Comenzará en instantes" en vez de un contador clavado en 00:00:00.
+  - **F38**: `isSameLive`: un poll que trae la misma fila conserva la referencia, así que la sala ya no se re-renderiza cada 3 s. Aplica en ambas salas.
+- **Global y admin**:
+  - **F40**: `<html lang="es">`, para que los lectores de pantalla pronuncien en español.
+  - **F30**: copiar (link público, servidor RTMPS) confirma solo si el portapapeles aceptó; si no, avisa.
+  - **F31**: `PROJECT_STATE.md` ya no describe un reproductor WebRTC de menos de 1 s.
+- **Tests**: `LivePlayerControls.test.tsx` (9, nuevo; mockea `motion/react` porque en jsdom la salida animada queda a medias), `LiveIntroOverlay.test.tsx` (4), +4 en `LiveChat.test.tsx`, +3 `isSameLive`, +1 F35. Suite 255/255.
+- **No abordados** (necesitan otra cosa que código): F06/F11 (fullscreen, volumen/PiP: teléfono), F09/F39 (player HLS, que se trabaja en paralelo en la rama `juan`), F18/F26/F27/F36 (decisiones de producto: replay VIP, moderación, datos de conectados, cambio de plan en vivo), F34 (depende del webhook H3), F24 (rediseño visual del chat), F28 (reorganizar el admin), F41 (convivencia con el podcast, requiere `PODCAST_ARCHITECTURE.md`).
+
+### Live — errores de carga honestos y controles del admin sin ambigüedad (auditoría UX: F16, F29)
+- **F16 · sala VIP**: si la primera carga fallaba, el error iba a consola y el alumno veía **"No hay eventos programados"** aunque la clase estuviera ocurriendo. Ahora hay un estado de error propio ("No pudimos cargar la sala", con **Reintentar**) que tiene prioridad sobre "sin eventos". Realtime y polling pasan por `refreshLive`: una respuesta buena reemplaza la sala y apaga el error (se recupera solo), y un fallo transitorio conserva la última sala conocida en vez de dejar una promesa rechazada sin capturar. Es el mismo criterio que la sala pública.
+- **F29 · panel admin**: "Detener" pausaba la sala (no OBS) y compartía ícono con Finalizar. Ahora es **Pausar** (`PauseCircle`) y **Finalizar clase**, con `title` y un texto de estado que aclaran que OBS sigue emitiendo. **Finalizar también está disponible en pausa**, donde antes solo aparecía Reanudar: el handler inline se extrajo a `handleFinalize`. La confirmación explica qué ven los alumnos, y el error ya no es un "Error" a secas.
+- **Tests**: `VIPLiveRoom.test.tsx` (5, los primeros de la página). El panel admin no tiene tests: verificado con typecheck y lint. Suite 234/234.
+
+### Live — título de la clase visible en celular (auditoría UX: F13)
+- **Problema**: en la barra del celular vertical el título estaba en un `hidden md:block`; el alumno no veía qué clase miraba. El botón de volver medía ~34 px.
+- **Cambio** (`LiveRoomHeader variant="bar"`): el logo, que es marca y no información, deja su lugar al título en una línea (`truncate`, con el sufijo "VIP" si corresponde). Volver pasa a 44 px (`w-11 h-11`). Escritorio y horizontal compacto sin cambios.
+- **Tests**: +1 en `LiveRoom.test.tsx`. Suite 229/229.
+
+### Live — chat: reintentar ya no duplica el mensaje (auditoría UX: F22, resto)
+- **Problema**: si el insert llegaba a la base pero se perdía la respuesta (4G inestable), el alumno veía "No se pudo enviar", reintentaba, y el mensaje salía dos veces.
+- **Cambio** (`LiveChat`): el cliente genera el `id` (`crypto.randomUUID()`) y un reintento del **mismo** texto lo reusa (`pendingSendRef`). Si el intento anterior sí había llegado, el reintento choca con la clave primaria: `23505` se toma como "ya enviado" y limpia el campo sin error. Otro texto, o un envío después de uno exitoso, lleva `id` nuevo. El eco de Realtime ya deduplicaba por `id`.
+- **Supuesto**: `live_messages.id` es `uuid` y acepta un valor explícito (el `CREATE TABLE` no está en el repo; lo confirma el tipo de `get_public_live_messages`). Si la columna se hubiera creado como `GENERATED ALWAYS`, el envío fallaría con un error visible, no en silencio. Verificar con un envío real.
+- **Tests**: +4 en `LiveChat.test.tsx`. Suite 228/228.
+
+### Live — merge con `master`: lo de la rama `juan` portado a la sala unificada
+- **Contexto**: `master` traía 19 commits de la sala en vivo (PR #94–#98) escritos sobre las salas **anteriores** a la unificación (F37), así que Git no podía aplicarlos: su código vivía en archivos que ya no tenían esa forma. Se portó a mano a `src/components/feature/live-room/`:
+  - **"Activar sonido" al primer toque** → `useLivePlayback.enableAudio`: `setIsMuted(false)` antes del `play()` (`muted` es prop controlada; tocar solo `video.muted` se revertía en el siguiente render) y `AbortError` = el audio ya quedó activo, no se revierte.
+  - **Clase completa (DVR)**: `resumeKey`/`onResumed` + toast "Retomamos donde lo dejaste" / "Ir al vivo" → `LivePlayerStage`, así lo tienen ambas salas.
+  - **Repetición paga** (`canWatchReplay`, `replay_is_public`) → `PublicLiveRoom`. `LiveReplay` pide la URL con sesión si el plan lo habilita, o anónima por `share_token` si la sala la abrió. Nuevo `LiveReplayPaywall`, que entra por la prop `endedNotice` de `LiveRoom`. El chequeo de `publicLiveHasRecording` guarda la respuesta junto a su token, en lugar de resetear estado dentro de un efecto.
+- **Mezcla automática revisada**: `LivePlayerControls` (el toque de F03 más la barra de Clase completa, en zonas distintas), `lives.ts` (funciones de ambos lados) y `lives.test.ts` (se conservaron los tests de los dos).
+- **Tests**: 224/224, suma de ambos lados más 1 del aviso de sala finalizada.
+
+## 2026-09-24
+
+### Live — teclado del chat: la parte determinista (auditoría UX: F15, con F23 y T13)
+- **Zoom de iOS al enfocar**: el campo del chat pasa de `text-sm` (14 px) a `text-base` (16 px). Con menos de 16 px, Safari de iOS agranda la página al enfocar y la sala queda descuadrada al cerrar el teclado. No se bloquea el zoom del viewport, que es una necesidad de accesibilidad.
+- **Teclado virtual**: `enterKeyHint="send"` (la tecla dice "Enviar") y `autoComplete="off"`.
+- **IME (T13)**: un Enter que confirma una composición (`isComposing`) ya no envía el mensaje a medias.
+- **Chat anclado al cambiar de alto**: `useChatScroll` observa la lista (`ResizeObserver`). Si el lector estaba al final y la lista se achica (teclado, rotación, panel), lo mantiene en el final. Achicarse no dispara `scroll`, así que antes los últimos mensajes quedaban tapados hasta que llegaba el siguiente. Leyendo arriba, se desconecta y no lo mueve.
+- **Poca altura**: la leyenda decorativa bajo el composer ("Encuentro exclusivo…") se oculta con `max-height: 500px` en ambos chats.
+- **Decidido NO tocar sin dispositivo**: `viewport-fit=cover` (sin él, iOS ya deja el contenido fuera del notch y del indicador; activarlo obliga a paddear toda la app), `interactive-widget` (cambio global del viewport en Android) y `VisualViewport`. Por defecto iOS y Android desplazan la vista para que el campo enfocado quede visible, lo que ya cumple la auditoría ("el video puede salir del área visible, pero no reiniciarse"). Queda pendiente confirmarlo en iPhone y Android: vertical, horizontal, abrir/cerrar teclado y rotar con borrador.
+- **Tests**: +2 en `useChatScroll.test.tsx` y +3 en `LiveChat.test.tsx`. Suite 201/201.
+
+### Live — celular en horizontal: layout compacto por altura (auditoría UX: F12 segunda tanda, F42, F25 parcial)
+- **Problema**: el layout se decidía solo por ancho (`min-width: 768px`). Un 844×390 heredaba el de escritorio: chat fijo de 320 px, header con 32 px de padding sobre el video, cuenta regresiva con cajas de 176 px, y `md:h-screen` (100vh) más alto que lo visible en Safari, que cortaba los controles (F42). Un 667×375 caía en el apilado, con el video topeado en 225 px y ~100 px de chat.
+- **Tres layouts** (`getLiveRoomLayout`, puro): `stacked` (celular vertical), `side` (pantalla amplia) y `compact`: horizontal con ≤500 px de alto (`useIsShortLandscape`), **sin importar el ancho**. La altura manda sobre el ancho.
+- **Compacto**: el video ocupa la pantalla y el chat arranca **cerrado**; se abre como panel lateral (`min(20rem, 45vw)`) con la pestaña y el contador de no leídos de escritorio. El header queda en volver + estado + conectados (`variant="compact"`), sin logo ni título encima de la clase; el título sigue como `h1` `sr-only`. La cuenta regresiva usa tamaños de celular (`LiveCountdownView compact`) y se centra con `m-auto` para poder scrollear si no entra.
+- **Estado del chat por layout**: `sideChatOpen` y `compactChatOpen` por separado. Al rotar a horizontal el chat arranca cerrado, y al volver a pantalla amplia conserva lo que eligió el alumno. Sin efectos que sincronicen.
+- **F42**: lado a lado, la isla y el panel toman el alto de la fila (`100dvh`) en vez de `md:h-screen`. La dirección de la fila la decide el layout (JS), ya no `md:flex-row`.
+- **F25 (parcial)**: el panel de chat cerrado queda `inert`: no se enfoca ni lo recorre un lector de pantalla, y sigue montado para contar no leídos. Contenedor extraído a `LiveChatPanel`.
+- **Pendiente**: el teclado en horizontal (deja ~150 px) no tiene tratamiento propio (F15). No se probó en un dispositivo físico.
+- **Tests**: `liveRoomLayout.test.ts` (3) y +4 en `LiveRoom.test.tsx`. Suite 196/196.
+
+### Live — rediseño mínimo: audio compacto, video a su proporción y chat que respeta la lectura (auditoría UX: F01, F12, F19 + F02/F03)
+- **F01 · audio**: el aviso "Activar sonido" ya no es una capa con blur sobre todo el player. Es una píldora en la esquina inferior izquierda (espejo del selector de calidad) con **Activar sonido** y una ✕ "Seguir sin sonido". El video se ve nítido sin audio y el aviso no vuelve una vez que el alumno elige, desde el aviso o activando el sonido en la barra. Se oculta si el audio ya está activo o hay error. `useLivePlayback` suma `dismissAudioPrompt`. **F02** queda resuelto: el contenedor ya no repite el clic del botón.
+- **F03 · toque en el video** (necesario para F01): con el aviso chico, el primer toque en el celular caía en la superficie del video, que **pausaba**. Ahora, con el dedo, tocar el video solo muestra los controles, y pausar queda en la barra. Con mouse o teclado, el clic sigue pausando. Se distingue por `pointerType` en `LivePlayerControls`.
+- **F12 · layout móvil**: con el video al aire, el escenario toma la proporción 16:9 (`aspect-video`, tope `60dvh`) en lugar de `50dvh` fijo, y el chat se queda con el resto. En un 390×844 eran ~200 px de franja negra. En celular el header pasa a ser una barra propia arriba del video (`LiveRoomHeader variant="bar"`), porque flotando taparía la clase ahora que no hay franja negra. Sin video al aire (espera, finalizada) se mantiene `50dvh`. Escritorio sin cambios.
+- **F19 · scroll del chat**: `LiveChat` forzaba `scrollIntoView` en cada mensaje, arrastrando al alumno que leía arriba (y a la página). Nuevo `useChatScroll` (`src/hooks/`), compartido por `LiveChat` y `PublicLiveChat`: sigue el final solo si el lector está cerca (80 px), cuenta lo que llega mientras lee y muestra **"N mensajes nuevos"** (`ChatJumpToLatest`) para volver. Desplaza solo la lista. Enviar un mensaje vuelve al final.
+- **Pendiente de probar en dispositivo real**: jsdom no hace layout, así que la proporción del video, la barra del header, la píldora sobre videos claros y el gesto táctil solo están cubiertos por lógica, no por imagen. Celular horizontal (≥768 px de ancho) sigue usando el layout de escritorio: queda para la segunda tanda de F12 (decidir también por altura).
+- **Tests**: `useChatScroll.test.tsx` (4), `LiveAudioPrompt.test.tsx` (4). Suite 189/189.
+
+### Live — sala unificada: VIP y pública comparten `LiveRoom` (auditoría UX: F37)
+- **Por qué**: `VIPLiveRoom` (787 líneas) y `PublicLiveRoom` (683) eran copias que ya habían divergido (latencia inoperante solo en la pública, no leídos solo en la VIP, F33 arreglado solo en una). Cualquier rediseño se iba a hacer dos veces. Se unifican **antes** de rediseñar.
+- **Estructura**: `src/components/feature/live-room/`. `LiveRoom` compone layout, chat plegable y presencia. `LiveStage` decide el escenario (player / replay / finalizada / pausa / sin señal / espera). `LivePlayerStage` es el player con sus overlays. Además `LiveRoomHeader` + `LiveStatusBadge`, `LiveCountdownView`, `LiveIntroOverlay`, `LiveReplay`, `LiveChatToggle`, `LiveAudioPrompt`, `LiveStageMessage`. Hooks: `useLivePlayback` (devuelve `[playerRef, playback]`), `useLivePresence`, `useCountdown`. `getLiveRoomStatus` (puro) centraliza `showPlayer`/`isLive`/`isEnded`/`isPaused`.
+- **Las páginas quedan en lo que difiere**: VIP (143 líneas) resuelve la sala activa, el plan, Realtime + polling y la señal de OBS. Pública (163) resuelve el token + polling, el "no disponible" y el origen del replay. Las diferencias de presentación son props (`branding`, `backTo`, `signalConnected`, `cinematicIntro`, `replay`, `renderChat`).
+- **Cambios de comportamiento que trae unificar** (se tomó la versión más completa de cada lado):
+  - Pública: el selector de latencia ahora funciona (usa la misma preferencia que la VIP). Antes era `smooth` fijo con un callback vacío (**F10/H6**). Cambiar de modo recrea `Hls`, igual que en la VIP.
+  - Pública con sesión: contador de no leídos con el chat oculto, e icono de panel en lugar de `›`/`‹`.
+  - Pública: fade-in del player, segundo anillo del botón de audio y brillo de las cajas del countdown, como en la VIP.
+  - VIP: "Señal no configurada" usa el texto de la pública, sin mencionar Cloudflare. Se quitó la textura de `transparenttextures.com` (**F39**). Se borró la rama "Esperando señal…", que era inalcanzable.
+  - Ambas: sin presencia en una sala finalizada (el badge ya estaba oculto). La intro se dispara en cada transición a en vivo, y su timer ya no puede quedar colgado. El countdown calcula al montar, sin mostrar `00:00:00` el primer segundo. Los no leídos se reinician al mostrar/ocultar el chat.
+- **Fuera de alcance**: el chat sigue siendo dos componentes (`LiveChat` con Realtime y escritura; `PublicLiveChat` solo lectura por polling), porque su transporte es distinto. `clearPlayer()` del podcast sigue solo en la VIP (**F41**, a decidir con `PODCAST_ARCHITECTURE.md`).
+- **Lint**: los archivos de la sala quedan en 0 avisos (antes 5, entre `exhaustive-deps` y `set-state-in-effect`).
+- **Tests**: `LiveRoom.test.tsx` (7) y `liveRoomStatus.test.ts` (4), los primeros de las salas. Suite completa 181/181.
+
+### Live — tres fallas de pérdida de información (auditoría UX: F21, F22, F33)
+- **F21 · chat público congelado a partir del mensaje 101**: `get_public_live_messages` ordenaba `ASC` con `LIMIT`, así que devolvía los **primeros** N mensajes aunque el comentario decía "últimos". Ahora una subconsulta toma los más nuevos (`DESC, id DESC` + `LIMIT`) y los devuelve en orden de lectura. **SQL** (`sql/migrate-lives-public-link.sql`, aplicar manualmente en Supabase: basta con re-ejecutar el bloque `CREATE OR REPLACE FUNCTION public.get_public_live_messages` + su `REVOKE`/`GRANT`). Sin cambios en el cliente: `mergeMessagesById` ya conserva lo que sale de la ventana.
+- **F22 · el chat VIP perdía el mensaje si fallaba el envío**: `LiveChat` borraba el campo antes del `insert` y el error solo iba a consola. Ahora el texto queda hasta que Supabase confirma, un fallo muestra "No se pudo enviar tu mensaje…" (`role="alert"`, asociado al campo) y el botón se bloquea mientras se envía para evitar el doble clic. Si el alumno siguió escribiendo durante el envío, no se le borra lo nuevo. Límite conocido: si el insert llegó a la base pero la respuesta se perdió, reenviar duplica el mensaje.
+- **F33 · al finalizar, la sala VIP decía "No hay eventos programados"**: `fetchActiveLive` descarta las salas `ended`, así que la sala desaparecía y la vista de "Transmisión finalizada" nunca se alcanzaba. Nuevo `fetchLiveForRoom(currentLiveId)` en `lives.ts`: si no hay sala activa y la que se estaba viendo terminó, la devuelve. `VIPLiveRoom` lo usa en Realtime y en el polling (el montaje sigue con `fetchActiveLive`: entrar después del cierre muestra el estado vacío, como antes). Además `showIframe` ahora excluye las finalizadas, para que el cierre se vea aunque OBS siga conectado.
+- **Tests**: `LiveChat.test.tsx` (5, nuevo) y `lives.test.ts` (+4 de `fetchLiveForRoom`).
+
+### Auth — sesión única por cuenta (anti-cuentas compartidas)
+- **Decisión de producto**: **toda** cuenta (free, individual, VIP y admin) solo puede estar abierta en un dispositivo a la vez. Gana la sesión **más nueva**; la anterior se cierra con el aviso "Tu cuenta se abrió en otro dispositivo". Sin excepción para admins: abrir la app en el celular cierra el panel de la PC.
+- **Por qué no la opción del dashboard**: "Single session per user" de Supabase solo existe en el plan Pro y actúa al ritmo del vencimiento del JWT (hasta ~1 h), sin avisarle nada al usuario.
+- **SQL** (`sql/migrate-single-session.sql`, aplicar manualmente en Supabase): tabla `user_active_sessions` (RLS: cada uno lee su fila; sin escritura directa) en la publicación de Realtime, y RPC `claim_active_session()`. La RPC compara `auth.sessions.created_at` de la sesión que llama (claim `session_id` del JWT) con la registrada. Si es más nueva, la registra y borra las demás de `auth.sessions` (sus refresh tokens caen en cascada). Si es más vieja, se revoca a sí misma y devuelve `false`. Se decide por la fecha de creación y no por "el último que llamó" para que un F5 en el dispositivo viejo no le robe la sesión al nuevo.
+- **Frontend**: `src/lib/api/session.ts` (`claimActiveSession` → `active`/`superseded`/`unknown`) y `src/components/providers/SessionGuard.tsx` (montado en `App.tsx`). Verifica al entrar, al volver a la pestaña y ante cambios de su fila por Realtime. Con `superseded` hace `signOut({ scope: "local" })` y muestra un toast. **Fail-open**: si la RPC falla (red, migración sin aplicar) no expulsa a nadie, así que el front puede desplegarse antes que el SQL.
+- **Límites conocidos**: un access token ya emitido vale hasta su vencimiento. El cierre inmediato lo hace el cliente, y un cliente manipulado podría estirar hasta ~1 h. Evita el uso **simultáneo**, no el uso por turnos. Endurecimiento posible a futuro: exigir en RLS que `auth.jwt()->>'session_id'` coincida con la sesión activa.
+- **Tests**: `session.test.ts` (5) y `SessionGuard.test.tsx` (7).
+### Live público — repetición abierta a todos, opt-in por sala
+- **Pedido del cliente**: la repetición de un live público (`/live/<token>`) es paga por defecto (Individual/VIP/admin, ver 2026-09-22), pero el admin ahora puede abrirla a cualquiera, sin cuenta ni plan, para una clase puntual — el resto de las salas sigue paga por defecto.
+- **SQL** (`sql/migrate-public-live-open-replay.sql`, aplicar manualmente en Supabase): nueva columna `lives.replay_is_public boolean NOT NULL DEFAULT false`. `get_public_live` revela `recording_stream_uid`/`recording_r2_key` cuando `can_watch_live_replay(auth.uid())` **o** `replay_is_public = true` (antes solo el primero). Sin policy nueva: la escritura ya es admin-only vía las RLS de `lives`.
+- **`api/stream/recording-url.ts`**: se reintrodujo la rama pública por `share_token` (había sido eliminada el 2026-09-22 por firmar sin chequeo de plan). Ahora está estrictamente gateada: llama a `get_public_live` con un cliente anon, y **solo firma si `replay_is_public === true`** en la fila devuelta — 404 si el token no corresponde a ninguna sala pública, 403 si la repetición no está abierta, 409 si la grabación no está archivada en R2. Rate limit propio por IP (`recording-url-public`, 20 req/min), reutilizando `getClientIp` y `signR2RecordingUrl` sin duplicar lógica. La rama autenticada (`live_id` + JWT + `allowed_plans`) queda intacta.
+- **`src/lib/api/stream/lives.ts`**: `LiveEvent.replay_is_public`; `setLiveReplayPublic(id, isOpen)` (mismo patrón que `setLivePublic`); `fetchPublicRecordingUrl(token)` — pide la URL firmada sin sesión (`fetch` crudo, no `authedFetch`), devuelve `null` en cualquier respuesta no-OK.
+- **`src/pages/public/PublicLiveRoom.tsx`**: `canReplay` ahora es `canWatchReplay(plan, role) || live.replay_is_public`. Con entitlement de plan sigue pidiendo la URL por `fetchRecordingUrl(live.id)` (autenticado); habilitado solo por `replay_is_public`, pide `fetchPublicRecordingUrl(token)`. El paywall no aparece en ninguno de los dos casos.
+- **`src/pages/admin/AdminLiveManager.tsx`**: `PublicLinkControl` suma un segundo toggle "Repetición abierta a todos" (solo visible con el link público activo), con su propio estado de carga y toast, conectado a `setLiveReplayPublic`.
+- **Tests**: `api/stream/recording-url.test.ts` (rama pública: firma si `replay_is_public`, 403 si no, 404 sin sala, 400 con token corto; rama autenticada sigue exigiendo JWT) y `src/lib/api/stream/lives.test.ts` (`setLiveReplayPublic`).
+- **Aplicar en Supabase**: correr `sql/migrate-public-live-open-replay.sql` (idempotente, requiere que `sql/migrate-public-live-replay-paid.sql` ya esté aplicada).
+
+## 2026-09-23
+
+### Clase completa — "Retomamos donde lo dejaste" salía sin razón, y el seek sin feedback
+- **Síntoma 1**: el aviso de retomar aparecía aunque el alumno nunca hubiera retrocedido, y lo dejaba atrasado.
+- **Causa**: `savePosition` guardaba la posición cada 5 s SIEMPRE, incluso mirando al filo del vivo. Al volver más tarde el filo había avanzado, la posición guardada caía dentro de la ventana y se restauraba sola. Ahora solo se guarda si el alumno está a más de 30 s del filo (retroceso deliberado); si estaba en vivo, la entrada se borra.
+- **Síntoma 2**: navegar con la barra se sentía tosco y lento.
+- **Causa**: el spinner de buffering espera 1.5 s a propósito (evita parpadeos con las micropausas del HLS) y el evento `seeking` no lo dispara, así que al soltar la barra quedaban hasta ~2 s sin ninguna señal visual. Ahora `seeking` muestra el spinner en el acto y `seeked` lo oculta.
+- **Medición del salto (producción, 1080p, ventana de 70 min)**: 0.6 s / 2.3 s / 2.6 s / 4.0 s / 5.1 s — promedio ~3 s. Causa medida: la playlist de DVR trae TODA la clase (57 KB y 2107 segmentos a los 70 min, contra 5 KB y 8 segmentos de la playlist normal) y el player la re-descarga cada pocos segundos; además cada fragmento de 1080p tarda ~2 s en bajar (para 2 s de video). A 3h40 la playlist rondaría los 180 KB — esto es exactamente la "degradación después de 3 h" que documenta Cloudflare.
+- **Descartado**: bajar `maxStarvationDelay`/`maxLoadingDelay` a 2 s en modo dvr. Probado en vivo: el ABR sí caía a 240p tras cada seek, pero el tiempo hasta ver imagen no mejoró (3.5 s vs 3.7 s). Perder calidad sin ganar velocidad — revertido. El costo está del lado de Cloudflare, no en nuestra configuración.
+
+
+### Live — "Activar sonido" requería varios toques
+- **Síntoma**: había que tocar "Activar sonido" dos o tres veces para que el aviso desapareciera y se oyera el audio.
+- **Causa 1**: `muted` es prop **controlada** del `<video>` (`LiveHLSPlayer.tsx`). El handler hacía `video.muted = false` de forma imperativa mientras `isMuted` seguía en `true`; el `setAudioRetryHint(false)` de la primera línea disparaba un re-render que volvía a aplicar `muted = true` y pisaba el cambio. Ahora el estado de React se actualiza ANTES de pedir el `play()`.
+- **Causa 2**: un `AbortError` de `play()` (otro `play()`/`pause()` del propio player lo interrumpe: pausa de sala, catch-up de latencia, vuelta de background) se trataba como bloqueo del navegador y revertía a mudo. Ahora se distingue: `AbortError` da por bueno el audio; solo un rechazo real revierte y muestra el reintento.
+- **Nota**: el botón NO se puede eliminar — los navegadores bloquean el autoplay con sonido sin interacción previa del usuario. El video arranca mudo por política de Chrome/Safari/Firefox, igual que en YouTube o Twitch.
+- Aplicado en `VIPLiveRoom.tsx` y `PublicLiveRoom.tsx`.
+
+
+### Live público — fix del paywall de repetición y link público en "Finalizados"
+- **Bug 1 — el paywall de repetición nunca aparecía**: `get_public_live` (ver `sql/migrate-public-live-replay-paid.sql`, cambio del 2026-09-22) anula `recording_stream_uid`/`recording_r2_key` para quien no tiene plan pago. `PublicLiveRoom.tsx` derivaba `hasRecording` de esas mismas columnas, así que para un visitante anónimo/Free `hasRecording` siempre daba `false` y nunca se llegaba a `showReplayPaywall` — se mostraba la pantalla genérica de "transmisión finalizada" en vez del paywall.
+  - **Fix**: nueva RPC `public.public_live_has_recording(p_token)` (`sql/migrate-public-live-has-recording.sql`) que devuelve solo un `boolean` (nunca el id/key) indicando si la sala tiene grabación vinculada, sin depender del plan del caller. Nuevo helper `publicLiveHasRecording(token)` en `src/lib/api/stream/lives.ts`. `PublicLiveRoom.tsx` la consulta una vez que el live termina y el visitante no tiene `canReplay`, y arma `showReplayPaywall` con ese boolean en vez de con `hasRecording`.
+  - **Copy del paywall actualizado** (pedido explícito del cliente, redacción muy seca): título del live visible arriba, encabezado "La repetición es para alumnos", cuerpo de dos oraciones explicando que el en vivo fue abierto para todos y que la grabación completa queda para alumnos con plan Individual o VIP. Botón primario "Inicia sesión" (anónimo) → login, o "Ver planes" (logueado sin plan pago) → `/planes`. Para anónimos se agrega además un link secundario "Ver planes" bajo el botón principal, para llegar a la oferta sin necesidad de loguearse antes.
+- **Bug 2 — el toggle de link público desaparecía al finalizar la sala**: `AdminLiveManager.tsx` solo renderizaba el control "Link público" (toggle + URL + "Copiar") en la pestaña de salas activas. `fetchLives()` filtra `.neq("status","ended")`, así que al "Finalizar" una sala pasa a "Finalizados" (`fetchEndedLives()`), donde ese control no existía — el admin no podía ver ni reactivar el link público para compartir la repetición.
+  - **Fix**: el bloque se extrajo a un componente local `PublicLinkControl` (misma UI, sin duplicar JSX) y se reutiliza en ambas pestañas. En "Finalizados" actualiza `endedLives` en vez de `lives` al togglear.
+- **Aplicar en Supabase**: correr `sql/migrate-public-live-has-recording.sql` (idempotente).
+
+## 2026-09-22
+
+### Live público — la repetición pasa a ser contenido pago
+- **Decisión de producto**: el en vivo en `/live/<token>` sigue siendo público para cualquiera (anon incluido), pero la repetición (grabación) ahora es solo para planes Individual/VIP y admin. Free y anónimos ven el en vivo completo, pero al finalizar ven un paywall en vez de la grabación.
+- **`src/lib/plans.ts`**: nuevo helper `canWatchReplay(plan, role)` (admin/individual/vip → true), con tests en `plans.test.ts`.
+- **SQL** (`sql/migrate-public-live-replay-paid.sql`, aplicar manualmente en Supabase): `get_public_live` sigue devolviendo la fila completa del live público, pero anula `recording_stream_uid` y `recording_r2_key` a menos que `auth.uid()` corresponda a un perfil `role='admin'` o `plan IN ('individual','vip')` (nuevo helper `can_watch_live_replay(uuid)`). El resto de columnas no cambia.
+- **`api/stream/recording-url.ts`**: se eliminó la rama anónima por `share_token` — firmaba una URL de R2 para cualquier caller con el token, sin validar plan. El endpoint ahora solo acepta `{ live_id }` con JWT (rama que ya validaba `allowed_plans`); la sala pública reusa esta misma rama con sesión iniciada. Se retiraron `getClientIp` y el cliente Supabase anónimo del handler (quedaron sin uso).
+- **`src/pages/public/PublicLiveRoom.tsx`**: `isReplay` ahora requiere `canWatchReplay(sessionUser?.plan, sessionUser?.role)` además de `isEnded && hasRecording`. Sin ese permiso se muestra una pantalla "La repetición es solo para alumnos" con botón "Inicia sesión" (anónimo) o "Ver planes" (Free logueado). El fetch de la URL firmada de R2 pasa de `fetchPublicRecordingUrl(token)` a `fetchRecordingUrl(live.id)` (autenticado). `src/lib/api/stream/lives.ts` perdió `fetchPublicRecordingUrl` (sin más usos).
+- **Límite conocido**: la grabación de Cloudflare Stream se sirve por iframe/manifest público sin firmar — alguien que ya haya extraído un `recording_stream_uid` de una sesión previa (por ejemplo, de la network tab) podría seguir reproduciéndolo directo. Anular el uid en la RPC cierra el camino fácil; el cierre real requeriría `requireSignedURLs` de Cloudflare Stream (pendiente, fuera de este cambio).
+
+## 2026-09-21
+
+### Comunidad — Free en modo lectura, Certificado oculto para Free
+- **Decisión de producto**: Free ya no queda excluido de "Comunidad VIP" — puede ver posts y comentarios (solo lectura), pero no publicar, comentar ni reaccionar. Free tampoco ve la pestaña "Certificado" (no puede completar módulos, no tiene insignias que mostrar).
+- **RLS** (`sql/migrate-community-free-readonly.sql`, aplicar manualmente en Supabase): nuevo helper `public.can_read_community(uid)` (true para `role='admin'` o `plan IN ('free','individual','vip')`) reemplaza `is_vip_or_admin` en las policies SELECT de `community_posts`, `community_comments` y `community_likes`. `is_vip_or_admin` sigue intacto como gate de escritura (INSERT/UPDATE/DELETE). El storage de imágenes (`community_images`) ya era público en SELECT, sin cambios ahí.
+- **Frontend**: `src/lib/plans.ts` (nuevo) centraliza `canReadCommunity`, `canWriteCommunity`, `canAccessCertificates` — admin siempre `true`, free lee comunidad pero no escribe ni ve certificados. `StudentDashboard.tsx` y `Header.tsx` ocultan "Certificado" para Free y muestran "Comunidad VIP" para todos los planes. `CommunityFeed`/`PostDetail`/`PostCard`/`LikeButton` reciben `canWrite`: ocultan composer, reply y like para Free y muestran una tarjeta CTA ("Estás viendo la comunidad en modo lectura" → `/planes`). `src/lib/api/community.ts` agrega `assertCanWriteCommunity()` como defensa en profundidad antes de cualquier escritura (RLS sigue siendo el gate real).
+- **Modelo de seguridad**: lectura = free/individual/vip/admin; escritura = individual/vip/admin. Ver `sql/migrate-community-free-readonly.sql` para el detalle de políticas.
+
+### Live — botón Picture-in-Picture y mensaje de bienvenida solo antes de iniciar
+- **Segundo plano en Android**: Chrome pausa cualquier `<video>` de una pestaña oculta (política del navegador, no bug nuestro). Nuevo botón de ventana flotante en `LivePlayerControls` (`requestPictureInPicture` / `webkitSetPresentationMode` en iOS) que mantiene el video sonando al cambiar de app o bloquear el teléfono. Solo se muestra si el navegador lo soporta.
+- **Mensaje "Iniciamos en instantes"**: seguía fijado con el vivo ya iniciado. `LiveChat` y `PublicLiveChat` reciben `showWelcome`, que las salas pasan como `status === "scheduled"`.
+
+### Grabaciones — timeout de reconexión del Live Input subido a 300 s
+- **Síntoma**: el live del 19-09 quedó partido en 7 videos en Cloudflare (12 s, 59 s, 6 min, 18 min, uno con Error…) todos entre 17:32 y 17:41 UTC, más el principal de 3:18.
+- **Causa**: Cloudflare crea un video nuevo por cada sesión RTMP. `timeoutSeconds` (60) cubre caídas de red, pero NO un Stop/Start manual en OBS (cierre limpio = fin de emisión). Los pedazos de pocos segundos al arranque apuntan a reinicios manuales.
+- **Cambio**: `recording.timeoutSeconds` 60 → 300 en el input `950f6b77…` (via `scripts/configure-live-input.mjs`, que ahora preserva `preferLowLatency` y `deleteRecordingAfterDays` en el PUT). Verificado por API.
+- **Tradeoff**: la grabación se finaliza ~5 min después de cortar el stream. Al "Finalizar" de inmediato, el vinculado automático puede no encontrar video listo — esperar 5 min o usar "Cambiar grabación" después.
+- **Regla operativa**: una vez al aire, no tocar Detener/Iniciar en OBS; dejar que reconecte solo.
+- **Pendiente**: feature "Unir grabaciones" en el panel (concatenar varios UIDs del mismo input con ffmpeg en el pipeline de R2) para recuperar lives fragmentados como el del 19-09.
+
+### Live — baja latencia via LL-HLS
+- **Antes**: el modo "Baja latencia" seguía siendo HLS estándar con `liveSyncDuration` más chico (3s) — sin parts LL-HLS, el piso físico de Cloudflare es ~targetduration (≈3s), así que no bajaba de ahí.
+- **Cambio**: `LiveHLSPlayer` pide el manifest con `?protocol=llhls` cuando `latencyMode === "low"` (Cloudflare Stream Low-Latency HLS — **beta** de Cloudflare). El manifest LL-HLS trae `PART-TARGET`/`PART-HOLD-BACK` y partes de 0.5s; hls.js corre con `lowLatencyMode: true` y deriva su propio target de latencia de esos tags (ya NO se fija `liveSyncDuration`/`liveMaxLatencyDuration` en este modo — fijarlos pisa el cálculo automático). Esperado: ~2-4s del edge, contra ~6-10s antes.
+- **"Fluidez" no cambia**: sigue siendo HLS estándar sin el flag, `lowLatencyMode: false`, `liveSyncDuration: 8`. Es el fallback si LL-HLS da problemas en algún live real.
+- **OBS recomendado para "Baja latencia"**: keyframe 1-2s, **B-frames desactivados** (Cloudflare exige esto para LL-HLS). WHIP/WebRTC queda pendiente solo si alguna vez se necesita latencia sub-segundo.
+- Nuevo método en `LiveHLSPlayerHandle`: `getLiveSyncPosition()` — expone `hls.liveSyncPosition` para que `LivePlayerControls.handleGoLive` salte exactamente al target de LL-HLS en vez de restar un offset fijo al edge (con fallback al cálculo anterior si no hay instancia hls.js, ej. Safari nativo).
+- **Catch-up de latencia (medido en vivo real)**: con la config LL-HLS, `targetLatency` reporta ≈1.5s correctamente, pero el reproductor arrancaba ~7-8s atrás del edge y no convergía solo (no seteamos `liveMaxLatencyDuration`, a propósito, así que hls.js no fuerza el seek). Se agregó un catch-up manual en modo "low": al primer `playing` tras `MANIFEST_PARSED` (cubre montaje y cada recarga por recuperación) y en un chequeo cada 10s, si `hls.latency > targetLatency + 3` se hace `video.currentTime = hls.liveSyncPosition`. El chequeo periódico además exige ≥1s de buffer hacia adelante (nunca saltar a zona sin precargar) y respeta un cooldown de 30s entre saltos automáticos. Verificado en vivo: estabiliza en ~2.3s con buffer 1.5-2s y cero starvation en 30s (antes: 13.8s en modo estándar).
+
+**Medición en vivo real (2026-09-22, Chrome desktop, OBS transmitiendo, player de producción en dev):**
+
+| Modo | Latencia p50 | Buffer medio | Muestras sin datos |
+|---|---|---|---|
+| Fluidez (HLS estándar) | 10.2 s | 7.8 s | 0 / 27 |
+| Baja latencia (LL-HLS) | 3.4 s (min 1.9, max 4.2) | 2.7 s | 1 / 60 |
+
+Nota de medición: si la pestaña queda en segundo plano el navegador ralentiza el
+player y la latencia se dispara; el catch-up la corrige al volver, pero cualquier
+medición futura debe hacerse con la pestaña activa.
+
+### Live — tercer modo de latencia "Clase completa" (DVR de Cloudflare)
+- **Qué es**: tercer perfil en `LiveHLSPlayer`/`LivePlayerControls` (`latencyMode: "dvr"`, etiqueta "Clase completa") que usa el DVR de Cloudflare Stream (`?dvrEnabled=true` en el manifest) — el alumno gana una línea de tiempo scrubbable sobre toda la transmisión, con resume automático de posición al volver a entrar.
+- **Medido en vivo real**: DVR devuelve HLS v8, latencia p50 14.6s, ventana seekable CRECE con la transmisión (88s → 144s durante la prueba), 0 stalls, misma config hls.js que "Fluidez" (`lowLatencyMode: false`, `liveSyncDuration: 8`, `liveMaxLatencyDuration: 20`).
+
+| Modo | Latencia p50 | Ventana seekable | Notas |
+|---|---|---|---|
+| Baja latencia (LL-HLS) | ~3-5 s | ~21 s fija | requiere red estable |
+| Clase completa (DVR) | 14.6 s | crece con la transmisión (88s → 144s medido) | timeline + resume |
+
+- **Incompatibilidad confirmada**: `?protocol=llhls&dvrEnabled=true` responde HTTP 500 — DVR y LL-HLS son mutuamente excluyentes en Cloudflare Stream, nunca se combinan. El modo "low" sigue pidiendo solo `?protocol=llhls`; "dvr" solo `?dvrEnabled=true`.
+- **Resume de posición**: en modo "dvr" únicamente, `LiveHLSPlayer` persiste `video.currentTime` en `localStorage` (clave `live-position:<resumeKey>`, `resumeKey` = id de la fila `lives`) cada 5s y al pausar. Al volver a entrar, si hay una posición guardada de menos de 12 horas y cae dentro de la ventana seekable actual, retoma ahí en vez del filo del vivo y dispara `onResumed`; las salas (`VIPLiveRoom`, `PublicLiveRoom`) muestran un toast único "Retomamos donde lo dejaste" con acción "Ir al vivo". Todo acceso a `localStorage` está en try/catch (puede tirar en modo privado).
+- **Timeline**: nuevo slider en `LivePlayerControls`, visible solo en modo "dvr", con elapsed/total en `mm:ss` (o `h:mm:ss`). Nuevos métodos en `LiveHLSPlayerHandle`: `getSeekableRange()` y `seekTo(position)` (clamped a la ventana seekable).
+- **Caveat conocido (sin resolver en este cambio)**: Cloudflare documenta degradación de performance en broadcasts DVR de más de 3 horas; las clases de Iván duran ~3:18, cerca del límite documentado — a monitorear en el primer live real con DVR activo.
+- Cambiar de modo de latencia sigue recreando la instancia de `Hls` (H6, ver arriba) — el cambio se ve como un breve reload, sin cambios acá.
+
+**Verificado en vivo (2026-09-23, OBS transmitiendo):** ventana navegable real de 0 a 1528 s
+(25 min de clase), retroceso a los 10 min que se mantiene, retomar posición guardada
+(15:00 sobre 32:22) y botón "Ir al vivo" que vuelve al filo (-11.9 s).
+
+Dos correcciones sobre la primera implementación, encontradas probando en vivo:
+- `liveMaxLatencyDuration: 20` se aplicaba también a `dvr`: hls.js trataba el retroceso
+  como un error de latencia y devolvía al filo del vivo de un salto ("no me deja
+  devolverme"). En `dvr` ya no se fija ni `liveSyncDuration` ni `liveMaxLatencyDuration`.
+- El retomar posición solo se intentaba en `MANIFEST_PARSED`, donde `video.seekable`
+  todavía está vacío, así que nunca restauraba. Ahora se reintenta en `LEVEL_UPDATED`,
+  antes del seek al filo.
+
+**Scrubbing (2026-09-23):** la barra llamaba a `seekTo` en cada evento `change` del
+`<input type="range">` — React mapea ese evento al `input` nativo, así que un arrastre
+disparaba un seek por cada movimiento del puntero y cada uno tira el buffer y vuelve a
+pedir fragmentos (se sentía a tirones). Ahora, como YouTube: mientras se arrastra solo
+se mueve el indicador (estado local `scrubValue`) y el seek se hace una sola vez al
+soltar (`pointerup` / `keyup` / `blur`). Verificado en vivo: 25 movimientos de arrastre
+→ 0 seeks durante el arrastre, 1 al soltar (antes: 25).
+
+### Modo claro — fase 6: selector publicado
+- `src/lib/theme.ts`: `APPEARANCE_SELECTOR_ENABLED` pasa de `import.meta.env.DEV` a `true`. El default sigue siendo oscuro; claro y Sistema quedan disponibles desde el selector del header.
+- Merge de `origin/master`: `LiveViewersDialog` y el replay del link público llegaron con la paleta vieja (`bg-darker`, `text-gold`, `textMuted`) y un "Probá"; se pasaron a tokens y a tú al resolver.
+- Detalle de lo revisado en navegador y de lo que quedó sin verificar: `docs/PROJECT_STATE.md` §4.1.
+
+### Modo claro — recorrido con cuentas free, individual y admin
+- **Free**: la tarjeta de módulo pasaba a gris translúcido en hover (`hover:bg-ink/5` le ganaba a `light:bg-surface-panel`) ⇒ `light:hover:bg-surface-panel` (`StudentDashboard`, `AdminMetrics`). "Mejorar mi Plan" parecía deshabilitado ⇒ borde y texto dorado en claro. Pistas `text-foreground-muted/50` (≈2,3:1 en claro) ⇒ `light:text-fg-40`.
+- **Editor de la landing**: el marcador "editado sin guardar" era ámbar pálido, igual al de guardado ⇒ `light:outline-warning` + tinte TRANSLÚCIDO (un fondo opaco tapa el texto con gradiente del título). Ícono de deshacer ⇒ `light:text-warning`.
+- **Voseo**: `scripts/voseo-scan.mjs` exigía 3 letras antes de la tilde y no veía "Usá"; ahora 2. Corregidos 4 textos (aria-label del reordenamiento, `LogoUploader`, nota y toast de `AdminLiveManager`).
+- **Layout, ambos temas**: en `/explorar/:id` "Volver al inicio" quedaba pegado al badge ⇒ `flex w-fit`. Con la barra del podcast abierta, el lápiz de edición y "volver arriba" quedaban tapados ⇒ `GlobalPodcastPlayer` publica `--podcast-bar-h` y ambos botones suben esa altura.
+- Verificado en navegador: individual (incluido cambio de tema con el podcast sonando, mismo `<audio>` sin corte), modo simple, dos pestañas sincronizadas, anchos 390/768/1024/1440, arrastre de lección y zonas de subida sin guardar nada.
+
+### Link público de live — identidad, lista de conectados y replay
+- **Lista de conectados compartida**: el diálogo "Conectados" de `VIPLiveRoom` se extrajo a `src/components/feature/LiveViewersDialog.tsx` (props `open`, `onOpenChange`, `viewers`, `totalViewers`, `currentUserId`) y ahora también lo usa `PublicLiveRoom`. El tipo `ViewerInfo` se movió a `src/types/live.ts`.
+- **Identidad en el link público**: si quien entra por `/live/:token` tiene sesión iniciada, se trackea presencia con la MISMA key (`user.id`) y el MISMO payload `ViewerInfo` que `VIPLiveRoom` — aparece por su nombre en la lista de conectados de todos, y NO se duplica el conteo si esa persona también abre la sala VIP (comparten el canal `live_presence:${live.id}`). Sin sesión, se conserva el tracking anónimo (`anon-<uuid>`) sin cambios.
+- **Replay (VOD) en el link público**: cuando el live termina (`status === 'ended'`) y tiene grabación, `PublicLiveRoom` muestra la grabación en vez de la pantalla de "finalizado" — sin chat ni presencia. Prioriza R2 sobre Stream (mismo criterio que `RecordingPlayer` del panel admin).
+  - **Grabaciones en Cloudflare Stream**: se sirven vía iframe público `https://<customer-code>.cloudflarestream.com/<uid>/iframe`, sin token firmado (no requieren auth).
+  - **Grabaciones en R2**: `api/stream/recording-url.ts` ahora acepta dos formas de body — `{ live_id }` (autenticada, sin cambios de comportamiento) o `{ share_token }` (nueva, sin JWT): valida el token contra `get_public_live` (RPC `SECURITY DEFINER`, ya gateada por `is_public = true`), aplica `applyCors` + rate limit propio (`recording-url-public`, por IP) y firma la URL de R2 con la misma función (`signR2RecordingUrl`, extraída y testeada) que la rama autenticada. No se tocó la RPC `get_public_live` — ya es `SETOF public.lives`, todas las columnas de grabación pasan sin cambios.
+  - Copy del admin: la nota del link público en `AdminLiveManager` ahora aclara que también permite ver la grabación cuando el en vivo termina.
+- **Hotfixes previos (2026-09-19) documentados acá por no estar registrados antes**: la página pública ya no expulsa al espectador por un solo poll fallido a `get_public_live` (requiere 2 misses consecutivos sin fila, nunca por error de red); y con sesión iniciada en el link público se muestra el chat completo (`LiveChat`, con envío) en vez del de solo lectura.
+
+## 2026-09-19
+
+### Modo claro — fases 4 y 5 recuperadas; fase 6 (cierre) queda pendiente
+- **Contexto**: el trabajo de tematización de las fases 4 (alumnos/multimedia) y 5 (administración) de `docs/MODO_CLARO_ESPECIFICACION.md` no estaba perdido: había quedado parkeado en `git stash` (`stash@{0}: On johan: fase6-admin-backup`, 44 archivos, +1327/−1242) mientras `master` avanzaba con los fixes de lives. Restaurado con `git stash apply` sobre `d598db0` — aplica limpio con 3-way; el stash se conserva como respaldo.
+- **Estado real por fase**: 1, 2 y 3 commiteadas en `87ca9fc`. 4 y 5 en working tree sin commitear. 6 sin empezar.
+- **Fix**: `HistoryPage.tsx` — el marco del video de la historia era `bg-black` sin declarar la isla oscura, así que en modo claro quedaba como una mancha negra dentro de una página marfil. Ahora lleva `data-theme="dark"`, mismo patrón que `LessonPlayer`.
+- **Verificación automática** (no reemplaza la revisión visual que pide la spec): `npm run typecheck` limpio; `npx vitest run` → 18 archivos / 137 tests; `scripts/theme-audit.mjs` sobre todo `src/` bajó de 143 a 61 hallazgos, y los 61 restantes caen dentro de islas oscuras declaradas (`LessonPlayer`, `VIPLiveRoom:314`, `PublicLiveRoom:260`, vitrina de certificados, `AuthPage:690`) o son scrims sobre foto de avatar. Barrido de paleta legacy: 3 usos, los 3 intencionales (`light:bg-darker` = placa oscura detrás del logo en claro).
+- **Fase 6 NO ejecutada — decisión explícita**: el selector sigue gateado en `src/lib/theme.ts` con `APPEARANCE_SELECTOR_ENABLED = import.meta.env.DEV`, o sea solo visible en desarrollo. Quitar ese gate publica el modo claro a los usuarios reales de Iván, y la puerta de salida de la fase 6 exige revisión visual humana previa (contraste sobre fondos compuestos, shimmer, gradientes, logos transparentes) — nada de eso lo cubre un script. **La plataforma está en vivo, así que no se activó.** Retomar cuando haya ventana para el recorrido visual.
+
+## 2026-09-18
+
+### Lives — RLS cerrada y detección de OBS corregida (Paquete 0-1 del plan de estabilización)
+- **Contexto**: auditoría externa del sistema de lives contrastada contra el código. Plan completo con hallazgos H1–H14 en `docs/LIVE_STABILITY_PLAN.md`.
+- **Seguridad (H1)**: la policy `"Allow all for authenticated on lives"` (`FOR ALL ... USING (true)`) estaba desplegada en Supabase — cualquier alumno logueado podía editar o borrar lives. Reemplazada por `sql/migrate-lives-rls-admin.sql`: SELECT se conserva, INSERT/UPDATE/DELETE solo si `profiles.role = 'admin'`. Aplicada en producción.
+- **Detección de OBS (H4)** (`api/stream/live-input-status.ts`): evaluaba `status.connected`, campo que no existe. Cloudflare devuelve `status.current.state` (verificado con respuesta real de la cuenta). `connected` era siempre `false`.
+- **Reproductor (H5, H7, H8, H9, H10 — Paquete 3)**: `LiveHLSPlayer`, `LivePlayerControls`, `VIPLiveRoom`.
+  - Cambio de calidad con `nextLevel` (no vacía el buffer).
+  - "EN VIVO" y umbral de "atrasado" según modo de latencia (3 s low / 8 s normal, con piso 10/5 s en low).
+  - Pausa del admin ya NO desmonta el player: overlay encima, `<video>` pausado explícitamente, reanuda solo si el alumno no pausó a mano. La intención del alumno se setea desde el botón play/pause (`setUserPaused`), nunca inferida del evento `pause` nativo (Safari lo dispara al ir a background y dejaba el player congelado).
+  - Recargas con backoff 1/2/4/8 s, máximo 6 por montaje, reset solo tras 15 s estables. Al agotar: estado de error + "Reintentar" (remount).
+  - "Activar audio" espera `video.play()`; si el navegador rechaza, mantiene el aviso con hint de reintento.
+  - Tests: `LiveHLSPlayer.test.tsx` 6 → 10. Revisión adversarial con contexto fresco encontró 3 bugs en la primera implementación (poison de `userPausedRef`, reset de backoff por fragmento, timer sin limpiar) — corregidos antes de commitear.
+- **Webhook (H2/H3)**: verificado que en Cloudflare → Notifications no existe ninguna notificación de Stream Live Input. El endpoint `/api/stream/cloudflare-webhook` nunca recibió eventos de OBS; toda la sincronización real fue polling. Se corrige después de H7 (ver plan).
+
+### Link público de live
+- Admin puede marcar una sala como pública desde `AdminLiveManager` y compartir `/live/<token>` — cualquiera lo abre sin login: mismo player, countdown/pausa/finalizado, chat de solo lectura y contador de viewers (anónimos incluidos).
+- **SQL a aplicar**: `sql/migrate-lives-public-link.sql` (agrega `is_public`/`share_token` a `lives` y las funciones `get_public_live` / `get_public_live_messages`).
+- **Modelo de seguridad**: anon nunca tiene SELECT directo sobre `lives` ni `live_messages`. El acceso público pasa únicamente por dos funciones `SECURITY DEFINER` gateadas por `share_token` + `is_public = true`. Anon no puede escribir mensajes (la sala pública no expone insert).
+
+## 2026-09-11
+
+### Login — la red móvil ya no tumba una sesión válida
+- **Síntoma**: alumnos veían "No pudimos iniciar sesión" desde el celular **estando ya autenticados**. Intermitente, solo móvil, solo a algunos.
+- **Causa**: `signIn` autentica y **después** consulta `profiles` y `subscriptions`. Si la red se corta ahí, supabase-js **rechaza la promesa** con `TypeError: Failed to fetch` en vez de devolver `{ data, error }`. Esa excepción escapaba y el `catch` de `AuthPage`, que solo traduce `ApiError`, la mostraba como error de login genérico — con la sesión ya creada en Supabase.
+- **Parche**: ambas consultas en `try/catch`; si fallan, el usuario entra con valores mínimos (`student` / `free`) y RLS sigue protegiendo los privilegios del lado del servidor.
+- **Bug hermano**: `decodeURIComponent(returnTo)` en `resolveReturnTarget` sin `try/catch` — un `%` mal formado lanzaba `URIError` y producía el mismo mensaje engañoso.
+- **Diagnóstico**: el `catch` del login ahora loguea el error real y distingue el fallo de red ("Se perdió la conexión..."). El mensaje genérico fue lo que ocultó la causa durante días.
+- **Tests**: `src/lib/api/auth.test.ts` (4) — login normal, red caída en cada consulta, y que las credenciales inválidas sigan lanzando `ApiError`.
+- **PENDIENTE DE DECISIÓN**: el parche deja un problema abierto — un VIP con mala señal entra viendo la plataforma como `free`. Degradación silenciosa. Ver `docs/AUTH_LOGIN_RESILIENCE.md` para las tres salidas evaluadas y la propuesta (retry con backoff + login limpio si falla).
+
+## 2026-09-07
+
+### Grabaciones de lives — se vinculaba el video equivocado y no se podía archivar
+- **Síntoma**: el live del 05-09 quedó vinculado a una grabación de 15 min en vez del vivo real de 3h25m. Al corregirlo, "Archivar en R2" respondía "El MP4 no se generó tras 12h; se descarta".
+- **Causa 1 — selección** (`api/stream/recording.ts`): un Live Input guarda **un video por cada transmisión**. OBS se reconectó 4 minutos después de terminar el vivo y Cloudflare creó un segundo video. El endpoint elegía "la más reciente" → la reconexión corta. Ahora elige **la más larga** (extraído a `sortReadyRecordings()`, con test que reproduce los datos reales del 05-09) y devuelve la lista completa.
+- **Selector de grabación** (`AdminLiveManager.tsx`): si el Live Input tiene más de una transmisión, se abre un diálogo con todas ordenadas por duración, marcando la sugerida y la vinculada. Nuevo enlace **"Cambiar grabación"** en Finalizados — antes, una vez vinculada, no había forma de corregirla sin Reactivar la sala (que la exponía a los VIP).
+- **Causa 2 — re-vincular no cambiaba el player**: `RecordingPlayer` prioriza R2 sobre Stream; si hay `recording_r2_key` nunca mira `recording_stream_uid`. Al cambiar la grabación de una sala ya archivada se seguía viendo la anterior. `applyRecording()` ahora limpia `recording_r2_key`, `recording_storage`, `recording_bytes`, `recording_duration_seconds` y `archived_at`. El MP4 anterior queda huérfano en R2 (barato, pero no se borra solo).
+- **Causa 3 — el Worker descartaba cualquier grabación de más de 12h** (`worker/src/index.ts`): el guard de staleness medía la antigüedad del *video* y se aplicaba justo después de habilitar el MP4 en la misma pasada. Con esa lógica ninguna grabación de más de 12 horas podía archivarse jamás — exactamente el caso de re-vincular un live pasado. Ahora un MP4 recién pedido siempre espera; solo se descarta si el video es viejo **y** la codificación nunca avanzó del 0%. **El Worker se despliega aparte** (`cd worker && npm run deploy`).
+- **Contexto de cuota**: la cuenta estaba en 1.008/1.000 minutos de Stream con 83 videos (lecciones incluidas). Archivar el vivo de 3h25m libera ~205 min, pero el problema de cuota es más amplio.
+
+## 2026-09-01 → 09-03
+
+### Reproductor de lecciones — progreso, podcast, anuncios y layout móvil
+- **Progreso exacto en cada transición** (`progress.ts`, `LessonPlayer`, `PodcastEngine`, `GlobalPodcastPlayer`): nueva `flushLessonProgress()` persiste el segundo exacto al pasar video → podcast, podcast → video, cerrar el reproductor, salir de la lección y esconder la pestaña. Antes esas cuatro transiciones solo escribían en el store local (localStorage) y la base quedaba con el último autoguardado periódico (hasta 10s atrás). Bug real: el cleanup de `LessonPlayer` leía `streamRef`, que en modo podcast está desmontado, así que salir escuchando no guardaba nada. Verificado en vivo contra Supabase (36→36, 55→55, 81→81, 99→99; con el store local borrado retomó en 1:39).
+- **Completar una lección es irreversible** (`progress.ts`): repasar una lección terminada escribía `is_completed: false` (el cálculo del 90% da false a los 12s) y la barra del módulo bajaba. Ahora un registro en memoria de lecciones completadas —alimentado por `fetchUserProgress` y `fetchAllUserProgress`— impide degradar. Protección del lado del cliente; un trigger en `user_lesson_progress` la haría definitiva (pendiente, requiere SQL manual).
+- **`progress_seconds` pasa a significar "dónde retomar"**: al ver una lección entera se guarda 0 (`resumePoint()`), y el modal de "Retomar Lección" ahora también aparece en lecciones completadas (decisión de producto: repasar no obliga a buscar el punto a mano). También aparece al ir **directo a podcast** en una lección a medias — antes se saltaba el modal y el audio arrancaba de cero. El botón dice "Continuar escuchando" cuando el destino es podcast.
+- **El podcast se repetía solo al terminar** (`PodcastEngine`): el navegador dispara `pause` **antes** que `ended`. `handlePause` evaluaba `endedRef` (todavía `false`) y programaba un `play()` a 200ms; para cuando corría, la pista había terminado y `play()` la reiniciaba. Encontrado instrumentando `play()` con stack traces. Fix: revalidar **dentro** del timeout + `isAtEnd()` como red de seguridad en los cuatro puntos que reproducen. Nuevo estado `hasEnded` (efímero) → la barra muestra "Lección completada", check verde y botón "Escuchar de nuevo". Documentado como regla 7 en `PODCAST_ARCHITECTURE.md`.
+- **Anuncios en celular no cargaban** (`LessonPlayer`): el `<Stream>` del anuncio tenía `autoplay` sin `muted`, y los navegadores móviles bloquean eso incondicionalmente. El contador quedaba en 30s, `onEnded` nunca llegaba y el contenedor era `pointer-events-none`: pantalla negra sin salida. Ahora monta muteado (autoplay garantizado), intenta activar el sonido al arrancar, capa de tap, watchdog (6s ayuda / 14s salta solo), `onError` sale del bloque, y progreso/omitir usan la **duración real** (`AD_DURATION` estaba fijo en 41s y el umbral de 30s era inalcanzable para el anuncio de prueba de 18s). Pantalla completa vía **Popover API** (top layer sin remontar el iframe). Overlays compactos para no tapar al aliado.
+- **`PageTransition` ya no anima `filter`** (`routes.tsx`): `blur(0px)` no es `none`, y un filtro activo convierte el wrapper en containing block — **todo `position: fixed` de la app se anclaba ahí en vez de al viewport** (medido: 5687px en vez de 812px). Framer Motion v12 anima por WAAPI, así que limpiar el inline style no sirve. Solo `opacity`. No volver a poner `blur` ni `transform` ahí.
+- **Playlist del módulo no scrolleaba sola** (`StudentDashboard`): **Lenis captura la rueda a nivel de window** y mueve la página, ignorando contenedores anidados. CSS no lo arregla; hace falta `data-lenis-prevent` (el patrón ya existía en `LiveChat` y `AdminLayout`). Además faltaba tope de altura por debajo de 1280px (`xl:max-h` solo) y `overscroll-contain` para el encadenamiento. **Toda zona scrolleable nueva necesita `data-lenis-prevent`.**
+- **Títulos largos** (`StudentDashboard`, `ModulePreview`): vienen con guiones bajos y sin espacios, el navegador los trata como una palabra. `min-w-0` en el grid item + `[overflow-wrap:anywhere]`. En el CTA de `ModulePreview`, `flex-wrap` + `min-w-0` en un hermano hacía que el texto colapsara a una palabra por línea (el wrap nunca se dispara si el hijo puede encogerse a cero).
+- **Admin — renombrar grabaciones finalizadas** (`AdminLiveManager`): edición inline del título en la pestaña Finalizados, sin reactivar la sala.
+- **Tests**: de 15 a 76 (`LessonPlayer`, `PodcastEngine`, `GlobalPodcastPlayer`, `progress`, `recording`).
+
+## 2026-08-31
+
+### Gestor de contenido — reordenar lecciones dentro de un módulo
+- **Drag & drop en la lista de lecciones** (`ModuleDetail.tsx`): cada fila es un `Reorder.Item` de `motion/react` (sin dependencias nuevas). Se arrastra únicamente desde un handle `GripVertical` a la izquierda (`dragListener={false}` + `useDragControls`), para que no se dispare un arrastre al apuntar a Editar / Publicar / Eliminar.
+- **Alternativa por teclado**: el handle es un `<button>` enfocable; con `↑` / `↓` mueve la lección una posición. Cubre accesibilidad y el caso de un mouse impreciso. Se desactiva solo si el módulo tiene una sola lección.
+- **Estado local durante el arrastre**: `ModuleDetail` mantiene el orden en su propio `useState` + `useRef`, así el padre no re-renderiza en cada frame. Recién al soltar (`onDragEnd`) avisa al padre.
+- **Guardado optimista** (`AdminContentManager.tsx`): la UI muestra el orden nuevo al instante y `updateLessonOrder()` persiste los `order_index` detrás. Si Supabase falla, revierte al orden previo y muestra toast de error.
+- **Feedback visible para el admin**: el header del módulo alterna entre "Arrastrá para reordenar" → "Guardando orden…" (spinner) → "Orden guardado" (check, se apaga a los ~2s), con `aria-live="polite"`.
+- **API**: nueva `updateLessonOrder(orderedIds)` en `src/lib/api/stream/content.ts`, espejo de la que ya existía para módulos.
+- **Tests**: `ModuleDetail.test.tsx` cubre presencia de handles, movimiento por teclado, límites en los extremos, handle deshabilitado con una sola lección e indicador de guardado.
+
+## 2026-08-14 → 08-18
+
+### Notificaciones por correo — bienvenida en producción y recordatorio de lives
+- **Sistema de correos propio** (Resend + Vercel Functions): dispatchers en `api/notifications/`, plantillas gemelas (`emails/*.tsx` para preview, `api/notifications/_*-template.ts` para envío, porque Vercel no empaqueta `emails/`).
+- **Bienvenida**: trigger Postgres sobre `auth.users` que detecta `email_confirmed_at` null → fecha y llama al dispatcher vía `pg_net` (`sql/notifications-welcome.sql`). Verificada en producción.
+- **Recordatorio de live VIP**: `pg_cron` cada 5 min → dispatcher que busca lives por empezar (ventana `LIVE_REMINDER_LEAD_MINUTES`, default 30), resuelve destinatarios por `allowed_plans` contra `subscriptions` activas y envía en lotes de 100 (`sql/notifications-live-reminders.sql`).
+- **Idempotencia**: tabla `notification_log` con única `(user_id, event_type, dedupe_key)`. El recordatorio **reserva antes de enviar** y libera la reserva si Resend falla, para que el próximo cron reintente sin duplicar.
+- **Seguridad**: los dispatchers exigen el secreto compartido `NOTIFICATIONS_WEBHOOK_SECRET` en el header, comparado con `timingSafeEqual`. `notification_log` tiene RLS habilitada **sin policies** — solo el service role la toca.
+- **UX del registro**: pantalla terminal "Revisá tu correo" tras registrarse, `emailRedirectTo` a `/cuenta-verificada`, y `RequireAuth` bloquea sesiones con email sin confirmar.
+- **Estado**: todo desplegado; falta verificar el primer disparo del cron de recordatorios y salir del sandbox de Resend (hoy solo entrega al correo de la cuenta). Ver `docs/CORREOS_HANDOFF.md`.
+
+## 2026-08-03
+
+### Lives — la grabación al finalizar ahora se vincula sí o sí
+- **Fix raíz del "Sin grabación disponible"** (`api/stream/recording.ts`): el endpoint consultaba `GET /stream?type=live&live_input=<id>`, cuyo filtro `type=live` solo matchea el video mientras transmite, nunca el VOD ya finalizado y `ready`. Por eso la grabación existía en Cloudflare (Ready y reproducible) pero volvía `recording_uid: null`. Ahora usa el endpoint dedicado `GET /stream/live_inputs/<id>/videos` y toma la grabación `ready` más reciente.
+- **Webhook endurecido** (`api/stream/cloudflare-webhook.ts`): como todos los eventos comparten el mismo Live Input, el `video.ready` vinculaba la grabación a cualquier sala sin grabación de ese input — incluida una programada futura. Ahora apunta solo a la sala que realmente transmitió (última `ended`/`live` por `starts_at`), nunca a una futura.
+- **Red de seguridad en el panel** (`AdminLiveManager.tsx`): botón **"Vincular grabación"** de un clic en la pestaña Finalizados para cualquier evento sin grabación. Recupera la grabación sin tener que Reactivar, Forzar EN VIVO ni pegar el UID a mano.
+- **Flujo resultante**: el equipo de cámaras aprieta Finalizar y se olvida; Cloudflare dispara `video.ready` y el webhook vincula solo; si algo fallara, se recupera en un clic.
+
+## 2026-07-27 → 07-28
+
+### Lives — grabaciones sanas, sin fragmentación y archivado automático a R2
+- **Fix codificación de grabaciones**: el keyframe interval de OBS en `Auto` hacía fallar la codificación del VOD ("failed to be encoded"). Corregido y documentado en la guía OBS del admin (keyframe = 2, modo Avanzado).
+- **Anti-fragmentación**: nuevo `scripts/configure-live-input.mjs` que setea `recording.timeoutSeconds=60` en el Live Input de Cloudflare. Antes, cada micro-corte de OBS creaba un video nuevo → decenas de clips sueltos.
+- **Guía OBS reescrita** (`AdminLiveManager.tsx`): estabilidad primero — ethernet, bitrate ≤ 50% del upload (tabla por velocidad), keyframe 2. Se quitó el push a WebRTC (sumaba inestabilidad) y el bitrate 4000-8000 riesgoso.
+- **Archivado automático a R2**: el `worker/` ganó un **Cron Trigger** (`scheduled()`, cada 10 min) que barre las grabaciones sin archivar, las copia a R2 y borra de Stream. El botón manual queda como forzado on-demand; ambos comparten `archiveOne()`.
+- **Robustez del archivado**: descarta grabaciones muertas — video en estado `error`, o pegado en 0% de generación de MP4 > 12h — para no reintentar infinito ni tapar el batch (`limit=3`).
+- **Repo**: los 18 scripts `.sql` se movieron a `sql/` con un `sql/README.md` que cataloga cada uno; se eliminó una imagen suelta; docs de estructura actualizadas.
+
+## 2026-05-21
+
+### Comunidad VIP — fix UX + diseño red social
+- **Fix final UX Modal "Crear publicación"**: el modal `NewPostDialog` ya no usa header/footer `sticky`. Ahora usa una estructura flex perfecta: `DialogContent` está limitado a la altura de la pantalla y no hace scroll (`overflow-hidden`); el form interno usa `flex-1 overflow-y-auto` en el cuerpo de los campos, dejando el header y los botones fijos naturalmente en la parte superior e inferior sin flotar sobre el contenido de forma invasiva.
+- **`isAdmin` no llegaba a `NewPostDialog`**: `CommunityFeed` no pasaba la prop. Corregido.
+- **Pin/unpin desde el feed (admin)**: nueva API `togglePinPost(id, pinned)` en `src/lib/api/community.ts`. Admin puede fijar/desfijar CUALQUIER post (suyo o ajeno) desde:
+  - **PostCard**: menú "⋯" → "Fijar publicación" / "Desfijar publicación".
+  - **PostDetail**: botón Pin/PinOff junto a Eliminar en el header del post.
+- **Separación visual fijados vs recientes** en `CommunityFeed`: headers "📌 Fijado por el equipo" (gold) y "🕐 Recientes" (muted) con línea gradient. Auto-ocultos cuando no aplican.
+- **Rediseño `PostCard` estilo red social profesional**:
+  - Avatar 48px con ring dinámico (gold si admin, blanco si user normal) + badge `Shield` dorado para admin.
+  - Header inline: nombre + badge admin + timestamp en una línea, categoría + pin chips en otra.
+  - Menú "⋯" agrupado (top-right) con dropdown que contiene pin (admin) y delete (autor/admin).
+  - Body con `whitespace-pre-wrap` para respetar saltos de línea + "Ver más" / "Ver menos" para posts >280 chars.
+  - Borde gold + accent line en top para posts fijados.
+  - Action bar inferior separada por `border-t` con LikeButton + contador de comentarios.
+- **Rediseño `PostDetail`**:
+  - Header tipo Twitter: avatar 56px con shield admin badge + ring dinámico, autor/timestamp en una línea, categoría+pin en otra.
+  - Borde dorado y línea de acento gradient arriba para posts fijados (consistente con PostCard).
+  - Body `whitespace-pre-wrap` respeta saltos de línea.
+  - Action bar inferior con border-t separador.
+  - `CommentBody`: avatares responsivos (40px raíz, 32px reply), shield admin badge, "Admin" pill, tipografía mejorada.
+- **Banner welcome `CommunityFeed`** más profesional: dot pattern de fondo, gold glow asimétrico, blob purple sutil, badge "Espacio exclusivo" con backdrop-blur.
+- **Fix Likes y contador de comentarios en tiempo real**:
+  - `LikeButton`: reescrito el manejo de estado optimista con `useEffect` separados para `liked` y `count`. Antes, el botón revertía visualmente el like si el prop del padre (que era viejo) causaba un re-render antes de que llegara el evento de Realtime.
+  - `CommunityFeed` y `PostDetail`: agregados listeners de Supabase Realtime para el evento `UPDATE` en las tablas `community_posts` y `community_comments`. Como los conteos están desnormalizados vía triggers en la BD (`like_count`, `comment_count`), escuchar los `UPDATE`s hace que todo el UI reaccione en tiempo real globalmente cuando cualquier usuario da like o comenta.
+
+- **Configuración avanzada de publicidad (Plan Free)**:
+  - Nueva migración SQL `sync_platform_ads.sql` para agregar `free_ad_type` ('preroll', 'midroll', 'both', 'none') y `free_ads_per_block` a la tabla `platform_settings`.
+  - El Panel de Admin (pestaña Operativa) ahora permite elegir:
+    - Modo de aparición: Solo al inicio, Solo intervalos, Inicio + Intervalos, Desactivados.
+    - Anuncios por pausa (consecutivos, e.g. 1 o 2).
+    - Frecuencia en segundos (sólo visible si hay intervalos activados).
+  - `LikeButton`: reescrito el manejo de estado optimista con `useEffect` separados para `liked` y `count`. Antes, el botón revertía visualmente el like si el prop del padre (que era viejo) causaba un re-render antes de que llegara el evento de Realtime.
+  - `CommunityFeed` y `PostDetail`: agregados listeners de Supabase Realtime para el evento `UPDATE` en las tablas `community_posts` y `community_comments`. Como los conteos están desnormalizados vía triggers en la BD (`like_count`, `comment_count`), escuchar los `UPDATE`s hace que todo el UI reaccione en tiempo real globalmente cuando cualquier usuario da like o comenta.
+
+## 2026-05-11
+
+### API de lives alineada al schema real de Supabase
+- `src/lib/api/stream/lives.ts`: `LiveEvent` reescrito para coincidir con la tabla real (`starts_at`, `status`, `stream_live_input_id`, `required_plan`, `allowed_plans`, `background_image_url`).
+- `fetchActiveLive()` ahora devuelve la sala con `status="live"` o la próxima `scheduled`.
+- `sanitize()` corregido: solo convierte `""` a `null` para campos presentes en el payload (no para undefined). Fix del error 400 al forzar EN VIVO que mataba `starts_at`.
+
+### AdminLiveManager — funcionalidad completa
+- **Timezone Colombia**: badge automático con timezone detectado (`Intl`). Helper `isoToLocalDatetime` para que el input `datetime-local` respete la zona horaria local al cargar datos guardados.
+- **Drag & drop de imagen**: subida a Supabase Storage bucket `backgrounds`. Fallback URL textual. Validación de tamaño (5MB max).
+- **Campos simplificados**: eliminado `duration_minutes` del UI. `required_plan` se auto-deriva del plan más alto en `allowed_plans`. Sin duplicados.
+- **Refresco al seleccionar sala**: `selectRoom()` hace fetch fresco a Supabase en vez de usar el estado local.
+- **Guía OBS**: pasos para CBR, keyframe 1s, 30fps, Low-Latency HLS y activación WebRTC.
+
+### VIPLiveRoom — WebRTC + polling
+- **Reemplazo de `<Stream>` por `<iframe>` directo**: URL modo WebRTC (`?mode=webrtc&preferLowLatency=true`) para latencia <1s. Usa `VITE_CLOUDFLARE_STREAM_CUSTOMER_SUBDOMAIN` del `.env`.
+- **Polling 3s**: consulta periódica a Supabase como fallback de Realtime (no requiere F5).
+- **Fallback de título**: si `live.title` existe, se muestra solo el título; si no, cae a "El conocimiento es la moneda definitiva".
+
+### SQL migrations
+- `docs/migrate-lives-schema.sql`: incluye:
+  - `ALTER COLUMN background_image_url` (si no existe)
+  - `ALTER TABLE ADD COLUMN is_active boolean NOT NULL DEFAULT false`
+  - `ALTER TABLE ADD COLUMN recording_stream_uid text`
+  - RLS policies para `lives`, `live_messages`, storage bucket `backgrounds`
+  - Habilitación de Realtime (`ALTER PUBLICATION supabase_realtime ADD TABLE lives`)
+  - WebRTC manual step reminder
+
+---
+
+## 2026-05-12
+
+### Columna `is_active` + selección manual de sala activa
+- **Motivación**: el admin quería elegir QUÉ sala se muestra a los usuarios, no que el sistema auto-seleccionara la más próxima.
+- **Columna `is_active`** (`boolean NOT NULL DEFAULT false`) agregada a tabla `lives`.
+- **`apiSetActiveLive(id)`** en `src/lib/api/stream/lives.ts`: desactiva todas las demás salas (`is_active = false`) y activa la seleccionada (`is_active = true`), todo en una transacción.
+- **`fetchActiveLive()`** reescrito: ahora solo consulta `is_active = true` + `status IN (scheduled, live)`. Sin auto-selección.
+- **Botón Activar/Inactivar** en `AdminLiveManager.tsx`: cada sala tiene un ícono de radio en la lista. Al clickear, llama a `apiSetActiveLive()` y actualiza el estado local + editor + toast.
+
+### VIPLiveRoom — real-time contra toda la tabla + acceso dinámico por plan
+- **Ruta `/vip-live`** (`routes.tsx`): se quitó `minPlan={PLANS.VIP}`. Ahora es accesible a cualquier usuario autenticado.
+- **Validación de plan en VIPLiveRoom**: en el mount, si el `activeLive` existe pero el plan del usuario no está en `allowed_plans`, redirige a `/dashboard` via `useNavigate`.
+- **Suscripción Realtime a TODA la tabla** `lives` (antes solo al `live.id` específico). Esto permite detectar:
+  - Admin activa otra sala → VIP se cambia instantáneamente a la nueva sala
+  - Admin forza EN VIVO → la sala transiciona a live → intro cinemática → stream
+  - Admin detiene → vuelve a scheduled → countdown
+  - Admin finaliza → `fetchActiveLive()` devuelve null → muestra "No hay eventos"
+- **`isLive`** ahora es derivado (`live?.status === "live"`) en vez de estado separado. Detener/Finalizar resetean correctamente la vista sin stale state.
+- **Polling 3s** siempre activo (ya no condicional a `!live || live.status === "live"`) para cubrir fallback de Realtime.
+
+### StudentDashboard — entrada anticipada ≤15 min
+- **Botón "Ver sala"** cuando el live está programado y falta ≤15 min para `starts_at`. Link a `/vip-live` para que el usuario entre a la sala de espera con countdown.
+- Si falta >15 min, muestra "Disponible para tu plan" (sin CTA).
+- La sección de lives ahora usa `fetchActiveLive()` en vez de `fetchLivesForPlan()`. Solo muestra la sala que el admin activó, si pertenece al plan del usuario.
+
+---
+
+## 2026-05-13
+
+### Grabación automática de lives (sin acceso a Cloudflare)
+- **`/api/stream/recording.ts`** (Vercel Function): consulta Cloudflare Stream API para obtener el video de grabación de un Live Input. También habilita MP4 downloads vía API (`POST /accounts/{id}/stream/{uid}/downloads`).
+- **`fetchRecording(liveInputId)`** en `src/lib/api/stream/lives.ts`: llama a la Vercel Function desde el frontend.
+- **Botón "Obtener grabación"** en AdminLiveManager editor: busca la grabación en Cloudflare y rellena `recording_stream_uid` automáticamente.
+- **Al hacer clic en "Finalizar"**: intenta obtener la grabación automáticamente. Si Cloudflare ya la procesó, se vincula automáticamente.
+- **URL de descarga corregida**: `{subdomain}/{uid}/downloads/` (plural, con 's') que lista los MP4 disponibles.
+- **Pestaña "Finalizados"**: muestra el iframe embebido de la grabación + botón descarga + botón "Reactivar" (cambia status de vuelta a scheduled).
+
+### VIPLiveRoom — auto-detección de OBS + sala persistente
+- **El iframe de Cloudflare WebRTC** se muestra automáticamente cuando `starts_at` ha pasado (sin depender de Forzar EN VIVO). Cloudflare maneja internamente el estado "live" / "waiting for signal" según si OBS está transmitiendo.
+- **Detección de OBS vía API**: cuando la sala está en countdown (antes de `starts_at`), `VIPLiveRoom` consulta `/api/stream/live-input-status.ts` cada 10s. Si Cloudflare reporta que el Live Input está `connected` (OBS transmitiendo), salta el contador y muestra el iframe inmediatamente.
+- **Nuevo estado "FINALIZADO"**: cuando admin hace clic en "Finalizar", la sala NO se oculta. Muestra "Transmisión finalizada" overlay + el chat sigue activo. Solo al desactivar `is_active` aparece "No hay eventos".
+- **Chat siempre visible**: en estados scheduled, live, ended y hasta que la sala se desactive.
+- **Badges dinámicos**: "EN VIVO" (rojo), "EN ESPERA" (dorado, OBS conectado o starts_at pasado), "PRÓXIMAMENTE" (antes de starts_at), "FINALIZADO" (gris).
+
+---
+
+## 2026-05-14 (Sesión 1)
+
+### Arquitectura robusta del Modo Podcast (Autoplay + Lock Screen)
+- **Desbloqueo de Autoplay en Móviles (Safari/Chrome)**: Modificado `PodcastEngine` para que SIEMPRE renderice el `<Stream>` (usando un video de Cloudflare silenciado como placeholder). Esto garantiza que el iframe exista en el DOM antes del gesto del usuario, permitiendo que `internalRef.current.play()` ocurra de forma síncrona sin ser bloqueado por los navegadores móviles.
+- **Secuestro de MediaSession (El fix "Stream" en Lock Screen)**: Cloudflare Stream sobreescribe la metadata del sistema operativo por defecto. Se implementó una técnica de "secuestro" ("hijacking") utilizando un elemento `<audio id="media-session-hijacker">` invisible (con una pista silenciosa `data:audio/wav`). Cuando el iframe emite el evento `onPlay`, se espera 100ms e inmediatamente se reproduce el audio silencioso para "robarle" el foco del reproductor al sistema operativo e inyectar la metadata real (`track.title`, "Escuela de la Riqueza" y el logo de la marca desde el CDN).
+- **Loop de Re-afirmación**: Añadido un intervalo cada 5 segundos que re-produce el secuestrador silencioso y actualiza la metadata, previniendo que iOS/Android le devuelvan el control al iframe al navegar o tras mucho tiempo.
+- **Mutex Video vs Podcast**: Modificado `LessonPlayer` para prevenir audios superpuestos. Si un usuario tiene el podcast en segundo plano e intenta darle "Play" a cualquier lección visual normal, el sistema automáticamente hace `closePlayer()` sobre el estado global del podcast antes de arrancar el video.
+
+---
+
+## 2026-05-14 (Sesión 2 — Footer, Páginas, Progreso)
+
+### Footer actualizado + páginas estáticas
+- **Redes Sociales**: URLs de Instagram y YouTube corregidas a las oficiales (`instagram.com/escueladelariqueza`, `youtube.com/@EscuelaDeLaRiqueza`). Eliminado "Las 6 inteligencias" del footer.
+- **Hash scrolling funcional**: Creado `useScrollToHash` hook en `src/hooks/useScrollToHash.ts`. Se invoca en `routes.tsx` y escucha cambios de `pathname` + `hash`. Cuando el hash cambia, hace `window.scrollTo` con offset -100px para respetar headers fijos. Timeout de 500ms para esperar transiciones de AnimatePresence.
+- **Links del footer reparados**: "Planes y precios" → `/planes#planes`, "Preguntas frecuentes" → `/planes#faq`. Se agregaron `id="planes"` y `id="faq"` en `Plans.tsx`.
+- **Nuevas páginas públicas**: `HistoryPage.tsx` (`/historia`) con video Cloudflare Stream embebido + copia profesional. `TermsPage.tsx` (`/terminos`) y `PrivacyPage.tsx` (`/privacidad`) con texto legal completo.
+- **Email de contacto**: Actualizado de `soporte@escuelariqueza.com` a `escueladelariquezaweb@gmail.com` en Footer, TermsPage y PrivacyPage.
+
+### Sistema de progreso de lecciones (user_lesson_progress)
+- **Tabla SQL en Supabase**: `user_lesson_progress` con columnas `user_id` (FK auth.users), `lesson_id` (FK lessons UUID), `progress_seconds`, `is_completed`, timestamps. RLS habilitado con políticas estrictas de select/insert/update solo para el propio usuario.
+- **`src/lib/api/stream/progress.ts`**: API completa (`fetchUserProgress`, `saveUserProgress`, `fetchAllUserProgress`) usando `upsert` con `onConflict: 'user_id,lesson_id'`.
+- **Auto-guardado en LessonPlayer**: cada 10s durante `onTimeUpdate` se llama `saveUserProgress()` con el `currentTime` actual. Throttle mínimo de 5s entre llamadas para no saturar Supabase.
+- **Regla del 90%**: si `currentTime / duration >= 0.9`, se marca `is_completed: true` automáticamente.
+- **Modal de retomo (Resume Modal)**: Al cargar una lección, se llama `fetchUserProgress()`. Si `progress_seconds > 5` y `!is_completed`, se muestra un Dialog (shadcn) premium con "Continuar viendo" (usa `pendingSeekRef` para hacer seek) o "Iniciar de nuevo".
+- **Progreso en StudentDashboard**: Barra dorada de progreso por módulo usando `completed-lessons / total-lessons * 100`. Checks verdes en la playlist de lecciones. Pestaña Certificados ahora muestra tarjetas por módulo: dorado + check si 100%, gris + bloqueado + barra de progreso si menos.
+
+### Fix PodcastEngine — stale closures en handlers del Stream
+- **Problema**: Al activar modo podcast, el iframe de Cloudflare se recargaba y su primer `onTimeUpdate` (con `currentTime: 0`) sobreescribía `lastKnownTime` en el store ANTES de que `onCanPlay` buscara restaurar la posición.
+- **Solución**: Se agregaron `lastKnownTimeRef`, `trackRef`, `lastVideoIdRef` sincronizados con `useEffect`. `handleTimeUpdate` ahora ignora eventos si `!initializedRef.current` (guard para evitar que el `onTimeUpdate` del iframe recién cargado pise el seek). `handleCanPlay`, `handlePlayEvent`, `handleTimeUpdate` leen desde las refs en vez del closure stale.
+- **Cambio en player.store**: `PodcastTrack.id` cambiado de `number` a `string | number` para soportar UUIDs reales de Supabase.
+
+---
+
+## 2026-05-14 (Sesión 3 — Upload, reordenar, podcast, insignias)
+
+### Fix: Loop de video pisaba `is_completed` (LessonPlayer)
+- **Problema**: Cloudflare Stream reinicia el video al llegar al final, `handleTimeUpdate` con currentTime≈0 pisaba `is_completed=false`
+- **Solución**: `endedRef` (useRef) que guarda `endedRef.current || ...` en el cálculo de `isCompleted`. `handleEnded` setea `playRequested=false` (corta el loop) y guarda completed. Overlay con check verde + "Reproducir de nuevo" cuando terminó.
+
+### Dashboard se actualiza sin F5 (polling fallback)
+- **Problema**: `user_lesson_progress` no estaba en la publicación Realtime de Supabase, el dashboard solo mostraba progreso tras F5
+- **Solución**: `setInterval` cada 15s que re-fetchea `fetchAllUserProgress()` y actualiza `userProgress`. La suscripción Realtime se conserva.
+
+### Progreso en modo podcast (PodcastEngine)
+- **Problema**: `handleTimeUpdate` solo actualizaba el store de zustand, nunca persistía en Supabase
+- **Solución**: Importado `saveUserProgress`. `handleTimeUpdate` guarda cada 10s con throttle 5s. `handleEnded` guarda con `isCompleted=true`. Mismas refs sincronizadas que en video.
+
+### Insignias con imágenes personalizadas
+- Agregado `badge_image_url?: string | null` a interfaz `Module` en `content.ts`
+- Certificates tab: si el módulo tiene `badge_image_url`, muestra `<img>` con grayscale si bloqueado, glow si desbloqueado; fallback a icono anterior
+- SQL migration: `docs/migrate-badge-image.sql`
+
+### Barra de progreso en subida de videos (AdminContentManager)
+- Nueva función `uploadFileWithProgress()` con `XMLHttpRequest` + `xhr.upload.onprogress`
+- Reemplazado `fetch` por XHR para tracking de progreso en tiempo real
+- Barra animated gradient gold en formularios de crear y editar lección
+- `uploadVideo` envuelto en try/finally para limpiar estado incluso en error
+
+### Reordenar módulos (AdminContentManager)
+- `updateModuleOrder(orderedIds)` con `PATCH` individuales en paralelo (`supabase.from("modules").update({ order_index }).eq("id", id)`) — evita error `null value in column "title"` que ocurría con `upsert`
+- Flechas ↑↓ en cabecera de cada módulo (solo desktop). `handleMoveModule` intercambia localmente y persiste.
+
+### Rediseño UX del AdminContentManager
+- Stats bar: módulos totales, lecciones, con video
+- Create module: card full-width con fade en vez de popup top-right
+- Cards con sombra, línea gold superior, icono BookOpen, contador de lecciones
+- Lecciones con barra lateral gold, icono en caja, badges de plan coloreados
+- Labels visibles en todos los campos del form
+- Todos los `alert()` reemplazados por toasts del sistema
+- Botones con spinner durante upload, drag zone con estados hover/focus/disabled
+- Skeleton loading en vez de texto plano
+- Selectores de plan como chips visuales con color por plan
+
+### Archivos modificados
+| Archivo | Cambio |
+|---|---|
+| `src/components/feature/LessonPlayer.tsx` | endedRef, overlay completado, guard en isCompleted |
+| `src/components/feature/PodcastEngine.tsx` | saveUserProgress en handleTimeUpdate y handleEnded |
+| `src/pages/student/StudentDashboard.tsx` | Polling 15s, badge_image_url en certificados |
+| `src/pages/admin/AdminContentManager.tsx` | Rediseño completo, upload progress, reordenar módulos |
+| `src/lib/api/stream/content.ts` | updateModuleOrder, uploadFileWithProgress, badge_image_url en Module |
+| `docs/migrate-badge-image.sql` | (nuevo) SQL para columna badge_image_url |
+
+---
+
+## 2026-05-15
+
+### Fix: Upload de videos a Cloudflare Stream (CORS + TUS Protocol)
+
+**Problema**: El upload usaba `XMLHttpRequest` + `FormData` contra `upload.cloudflarestream.com/{uid}`. Cloudflare Stream no habilita CORS para POST multipart/form-data desde navegadores. El preflight fallaba silenciosamente, el archivo nunca se subía, y Cloudflare mostraba "Video has no name" / "Pending Upload" para siempre. Además, fallaba por Content Too Large (413) y bloqueaba los videos requiriendo URLs firmadas.
+
+**Solución**: Reemplazado el mecanismo de upload por **TUS protocol** usando `tus-js-client` (librería oficial que Cloudflare recomienda para uploads desde browser).
+
+**Cambios técnicos:**
+- `src/lib/api/stream/content.ts` — `uploadFileWithProgress()` reescrito con `tus.Upload`. Envía `filename` y `filetype` como metadata TUS. Configurado `chunkSize` a 50MB para evitar error 413. Eliminado `requireSignedURLs` para evitar 401 Unauthorized post-subida.
+- `api/stream/upload-url.ts` — Agregado manejo de OPTIONS preflight con CORS headers (`Access-Control-Allow-Origin: *`). Soporte para `req.body.name` para nombrar el video y tamaño correcto usando `direct_user=true`.
+
+### Nueva Feature: Vista Pública de Módulos (Module Preview)
+- **`src/pages/public/ModulePreview.tsx`**: Nueva página pública `/explorar/:intelligenceId` para que usuarios sin registrar puedan visualizar la tabla de contenido, descripción y lecciones del módulo de una inteligencia específica.
+- **`src/components/feature/IntelligencesAct.tsx`**: Las "8 Inteligencias" de la landing ahora enlazan a los módulos reales de la DB a través de `/explorar/:intelligenceId`.
+
+### Mejoras UI: Certificados y Dashboard
+- **`src/pages/student/StudentDashboard.tsx`**: Se rediseñó la sección de certificados conectada con las insignias de los módulos reales y su texto correspondiente.
+
+### Cleanup: Eliminación de código muerto
+
+Se eliminaron 10 archivos que eran mocks/data quemados sin uso real:
+
+| Archivo | Motivo |
+|---|---|
+| `src/mocks/courses.ts` | Datos mock, no importado por ningún componente real |
+| `src/mocks/lives.ts` | Idem |
+| `src/mocks/users.ts` | Idem |
+| `src/mocks/` (directorio) | Quedó vacío |
+| `src/lib/api/courses.ts` | API mock envuelve mocks, no importada |
+| `src/lib/api/lives.ts` | Idem |
+| `src/lib/api/billing.ts` | Idem |
+| `src/pages/admin/AdminVideoUpload.tsx` | No enrutado en routes.tsx, reemplazado por AdminContentManager |
+| `src/types/course.ts` | Solo usado por mocks/APIs eliminados |
+| `src/types/live.ts` | Idem |
+| `src/types/subscription.ts` | Idem |
+
+**Archivos limpiados:**
+- `src/lib/api/client.ts` — eliminada función `delay()` (solo usada por APIs mock eliminadas). Conservado `ApiError` (usado por `auth.ts`, `AuthPage.tsx`, `ResetPassword.tsx`).
+
+**Verificación:** `npm run typecheck` ✅, `npm run test` (15/15) ✅, `npm run lint` (sin errores nuevos) ✅.
+
+### Estado actual del proyecto
+
+- **Upload de videos**: Funcional con TUS protocol. Pendiente verificar en producción tras deploy.
+- **Mocks**: 0 archivos mock. Todo el contenido se sirve desde Supabase (real).
+- **Tipos de datos**: Solo queda `src/types/user.ts`. Los tipos `Module`, `Lesson` están en `src/lib/api/stream/content.ts` donde se usan.
+- **Páginas admin**: Gestor de Contenido (`/admin/content`), Lives (`/admin/lives`), Métricas (`/admin/metrics`), Usuarios (`/admin/users`), Settings (`/admin/settings`).
+
+---
+
+## 2026-05-15 (Sesión 2)
+
+### Mejoras UI: Student Dashboard
+- **Mockup de Portal de Pagos**: Se reemplazó el botón de pagos inactivo por un modal completo (Dialog de shadcn) que simula el Customer Portal de Stripe.
+- Muestra la fecha real del `current_period_end` (o simulada si está vacío), junto a una tarjeta predeterminada y opciones para gestionar la suscripción.
+- **Fix de Ortografía**: Restaurados los acentos y 'ñ' en el archivo `StudentDashboard.tsx` que se habían perdido tras una conversión de codificación (suscripción, próximo, añadir, etc).
+
+### Rediseño: Página de Historia
+- **Nueva Estructura**: Se reconstruyó `/historia` dividiendo el contenido en dos columnas. Izquierda con la historia del fundador, derecha con un contenedor *sticky* para el diferenciador. Textos provistos por el usuario integrados.
+- **Fix de Cloudflare Stream (Layout Shift)**: Se eliminó el `responsive={true}` del componente `<Stream>` y se le aplicó `absolute inset-0 w-full h-full` dentro de un contenedor `aspect-video`. Esto evita que el SDK inyecte scripts de recálculo que bugueaban o interrumpían el scroll del usuario.
+
+### Fix: Descarga de Grabaciones (Lives)
+- **Corrección de URL Cloudflare**: El botón de descarga ahora apunta a `.../downloads/default.mp4` en lugar de la carpeta raíz, previniendo el error `404 Not Found`.
+- **Nuevo Endpoint (`/api/stream/download-status`)**: Creada una nueva Vercel Serverless Function para consultar el estado de renderizado del MP4 en tiempo real antes de descargarlo.
+- **Feedback Interactivo**: Al hacer clic en descargar, un `toast` avisa si Cloudflare está empaquetando el video (`inprogress` con porcentaje), si aún se está preparando (info), o abre la descarga directa si ya está `ready`.
+- **Fallback Local**: Si el servidor Vercel local (`/api`) está apagado en dev, atrapa el error `502 Bad Gateway` y abre la URL de emergencia para no bloquear el flujo de desarrollo.
+
+### Contenido: FAQ
+- Añadida nueva pregunta a la sección FAQ de `Plans.tsx` sobre la diferencia de Escuela de la Riqueza con otros programas de formación.
+
+---
+
+## 2026-05-16
+
+### Rework del player de live
+
+**Problema acumulado**: el approach del iframe raw con `mode=webrtc&preferLowLatency=true` + carga manual del SDK de Cloudflare via `<script>` y `window.Stream(iframe)` rompía la reconciliación de React. Síntomas en móviles:
+- Pantalla negra en Android (incluso con `muted=true&playsinline=true`)
+- Errores `NotFoundError: Failed to execute 'removeChild' on 'Node'` durante unmount
+- `Maximum update depth exceeded` (loop del ErrorBoundary cayendo por la cascada de removeChild)
+- En la práctica la latencia era ~10s aunque pidiéramos WebRTC (la ingesta RTMP de OBS hace que el playback caiga a HLS interno de Cloudflare)
+
+**Causa raíz**: el SDK manual mutaba el DOM del iframe fuera del ciclo de React. Cuando React intentaba desmontar el player (cambio de estado, AnimatePresence exit, etc.), encontraba el árbol corrupto y tiraba `removeChild`. Eso a su vez disparaba el ErrorBoundary, que intentaba renderizar el fallback mientras seguía habiendo nodos rotos, generando el loop `Maximum update depth`.
+
+**Fix** (`src/pages/student/VIPLiveRoom.tsx`):
+1. **Reemplazado iframe raw + SDK manual por `<Stream>` de `@cloudflare/stream-react`** (la misma lib que usa `LessonPlayer` y `HistoryPage`). La lib gestiona el iframe, el SDK y el cleanup de listeners internamente; nunca toca DOM por fuera de React.
+2. **Modo WebRTC eliminado**. Se usa HLS estándar (compatible con TODO dispositivo). Latencia 5-10s; no perdemos nada porque ya estábamos en ese rango por la ingesta RTMP.
+3. **`controls` activos** en el `<Stream>`: el usuario ve el reproductor nativo de Cloudflare con su botón de mute como respaldo.
+4. **Control de mute via `streamRef`**: nuestro botón overlay "Activar sonido" llama `streamRef.current.muted = false; player.volume = 1; player.play()` usando la API oficial de la lib. Sin remount, sin SDK manual.
+5. **Fade-in cinemático en capa separada**: motion.div con `bg-black opacity 1 → 0` encima del `<Stream>`. Cubre la transición visual sin afectar el iframe, que arranca a opacity 1 (clave para que Android no pierda la pista de video durante el compositing).
+6. **`CF_CUSTOMER_CODE`** se extrae del subdominio (`customer-XXX.cloudflarestream.com` → `XXX`) y se pasa como prop al `<Stream>` para mantener el subdomain del proyecto.
+
+**Trade-offs aceptados**:
+- Perdimos el ideal teórico de WebRTC (<1s). En la práctica nunca lo teníamos.
+- Ganamos: compatibilidad universal (iOS, Android Chrome, Samsung Browser, in-app browsers), cleanup robusto sin errores de React, botón nativo de mute como fallback, código sustancialmente más simple.
+- Para volver a <1s en el futuro: requiere migrar OBS a WHIP (ingesta WebRTC nativa) — sección Pendientes.
+
+### Pendientes de optimización del live (NO atacados aún)
+
+#### Latencia real es ~10s aunque el modo es WebRTC
+
+**Síntoma**: la URL del iframe pide `mode=webrtc&preferLowLatency=true`, que en papel da <1s. Pero medido con cronómetro frente a cámara, el delay real es ~10s. Eso significa que WebRTC **playback** está cayendo silenciosamente a HLS.
+
+**Causa probable**: la **ingesta** está en RTMP. OBS por defecto manda RTMP. Cloudflare puede servir WebRTC playback sobre RTMP ingest, pero el transcoding agrega latencia y muchas veces cae a LL-HLS. Para latencia <1s real, **ingesta y playback deben ser ambos WebRTC**.
+
+**Cómo verificar la latencia real**:
+1. Visual: cronómetro frente a la cámara de OBS vs reloj del cel viendo el stream.
+2. `chrome://inspect` desde PC con Android conectado → abrir `chrome://webrtc-internals` dentro del iframe. Si NO hay `RTCPeerConnection` activa, el playback NO es WebRTC — cayó a HLS.
+3. Cloudflare Dashboard → Stream → Live Inputs → tu input → tab "Connection". Muestra si la ingesta entrante es RTMP o WebRTC (WHIP).
+
+**Cómo bajarla cuando se ataque**:
+- Migrar OBS de RTMP a WHIP. Requiere OBS 30+ (Studio).
+  - Servicio: WHIP.
+  - URL: `https://customer-<TU_SUBDOMAIN>.cloudflarestream.com/<LIVE_INPUT_ID>/webRTC/publish`.
+  - Codec: H.264 **baseline** (NO main ni high — algunos decoders Android no soportan).
+  - Bitrate: 2500-5000 kbps CBR.
+  - Keyframe: 1s.
+- Alternativa intermedia (si Iván no puede migrar OBS): mantener RTMP pero forzar keyframe=1s + activar Low-Latency HLS en el Live Input. Latencia esperada: 2-5s en lugar de 10.
+- Después de migrar, validar con `chrome://webrtc-internals` que efectivamente hay PeerConnection activa.
+
+#### ¿Por qué el live "siempre" está en low latency?
+
+No es un bug, es la URL hardcodeada. Cloudflare Stream tiene tres modos de playback:
+
+| Modo | Latencia | URL param |
+|---|---|---|
+| HLS estándar | 10-30s | sin `mode` ni `preferLowLatency` |
+| LL-HLS | 2-5s | `?preferLowLatency=true` |
+| WebRTC | <1s (si la ingesta también es WebRTC) | `?mode=webrtc` |
+
+`VIPLiveRoom.tsx` siempre pide WebRTC + LLHLS. Si en algún momento se quisiera priorizar **estabilidad sobre latencia** (por ejemplo, para redes corporativas/móviles malas que bloquean UDP), habría que sacar ambos params y caer a HLS clásico. **No es necesario hoy**: WebRTC con fallback automático de Cloudflare ya cubre el caso de UDP bloqueado degradando a LL-HLS.
+
+---
+
+## 2026-05-19 (Sesión 2)
+
+### Feature: Comunidad VIP (Foro tipo Reddit)
+- **Base de datos (SQL)**: Creado `sync_community.sql` con las tablas `community_posts`, `community_comments` y `community_likes`. Incluye:
+  - Estructura de anidamiento de 1 nivel para comentarios (`parent_id`).
+  - Triggers para mantener actualizados `like_count` y `comment_count` en tiempo real para optimizar lecturas.
+  - Políticas RLS estrictas (Solo VIP y Admin pueden crear/ver, los autores pueden borrar sus propios posts/comentarios, admins pueden borrar cualquiera).
+  - Habilitación de publicación en Supabase Realtime.
+- **Capa API (`src/lib/api/community.ts`)**: CRUD completo. `fetchPosts`, `fetchPost`, `createPost`, `deletePost`, `fetchComments`, `createComment`, `deleteComment`, `toggleLike`. Optimización de estado `liked_by_me` inyectado en cada consulta usando `community_likes`.
+- **UI & Componentes (`src/components/feature/community/`)**:
+  - `CommunityFeed`: Orquestador principal, listas, filtros de categoría (Pregunta, Discusión, Recurso, Otro), ordenamiento (Recientes / Más populares). Subscripción a Realtime para posts nuevos.
+  - `PostCard` & `PostDetail`: Tarjetas resumen y vista completa del post. El detalle tiene un árbol de comentarios recursivo aplanado a un nivel, con subscripción a Realtime para comentarios nuevos/borrados.
+  - `LikeButton`: Toggle optimista con fallback en caso de error.
+  - `NewPostDialog`: Modal robusto validado para crear preguntas/discusiones.
+- **Integración**: Se reemplazó el placeholder de la pestaña "Comunidad VIP" en `StudentDashboard.tsx`. Usuarios gratis/individuales ven un estado vacío (candado) con botón de *upsell* para "Mejorar a VIP".
+
+### Ajustes en el Admin: Filtros por Periodo en Métricas
+- **SQL (`sync_admin_metrics_v2.sql`)**: Modificadas y creadas nuevas RPCs (`admin_count_new_users`, `admin_revenue_in_period`, `admin_get_top_lessons`) que ahora aceptan un parámetro `since timestamptz`. El top lessons ahora cuenta visualizaciones sólo dentro del período, manteniendo el `LEFT JOIN` para incluir lecciones con cero vistas.
+- **Frontend (`AdminMetrics.tsx` & `metrics.ts`)**: Agregado selector de periodo ("Todos los tiempos", "Últimos 7 días", "Último mes", "Último año"). Los KPIs cambian dinámicamente sus etiquetas ("Usuarios Totales" vs "Nuevos usuarios", "MRR Estimado" vs "Ingresos del período").
+
+### Fix: Scroll en Modo Desktop (Bug del iframe)
+- **Problema**: El `iframe` de Cloudflare en HistoryPage interceptaba todos los eventos de mouse en desktop, bloqueando el plugin de smooth scroll (Lenis) a menos que movieras el puntero fuera del video.
+- **Solución**: Se inyectó CSS global (`html.lenis-scrolling iframe { pointer-events: none !important; }`) para deshabilitar temporalmente los iframes durante un scroll activo en todo el sitio. Además, en `HistoryPage`, se puso un overlay transparente que absorbe scrolls pasivos.
+
+### Actualización de Copys (Contenidos)
+- **Historia (`HistoryPage.tsx`)**: Reescritura completa del texto por los contenidos actualizados del cliente ("La riqueza es una consecuencia...", "Rediseño cerebral", etc).
+- **Insignias de Certificados (`StudentDashboard.tsx`)**: Se renombró el módulo de "Inteligencia del aprendizaje" a "Inteligencia mental" en los textos locales (con fallback alias para retrocompatibilidad).
+- **Footer**: Añadidos íconos/SVG (`FbIcon`, `WaIcon`) y enlaces directos a Facebook y WhatsApp de la academia.
+
+---
+
+## 2026-05-19
+
+### Endurecimiento de seguridad: las 4 Vercel Functions ahora exigen JWT + admin role
+
+**Problema**: Las 4 functions (`api/stream/*`) no tenían autenticación. Cualquier persona en internet podía llamar `POST /api/stream/upload-url` y recibir una URL firmada para subir archivos a Cloudflare Stream contra la cuenta del cliente. Sin validación de body (`size`, `live_input_id`, `video_uid` se aceptaban tal cual). CORS de `upload-url` en wildcard (`*`). Esto era el riesgo más alto del proyecto.
+
+**Solución** (`api/_lib/auth.ts` nuevo + las 4 functions modificadas):
+
+- **`requireAuth(req, res)`** valida `Authorization: Bearer <jwt>` contra Supabase y devuelve `{ id, email, role, plan }` o `null` (ya respondió 401).
+- **`requireAdmin(req, res)`** = `requireAuth` + checkea `role === 'admin'`, sino 403.
+- **`applyCors(req, res)`** setea allowlist desde env `ALLOWED_ORIGINS` (separada por comas). En dev refleja el origin del request. Maneja preflight OPTIONS internamente y devuelve `true` si ya respondió.
+- **Sin `SUPABASE_SERVICE_ROLE_KEY`**: el helper usa anon key + JWT del header, respeta RLS, no expone service role. Una env var menos para configurar y menos superficie de ataque.
+
+**Matriz aplicada**:
+
+| Endpoint | Auth | Validación zod |
+|---|---|---|
+| `upload-url.ts` | `requireAdmin` | `size` (int positivo, max 5GB) + `name` opcional (max 200) |
+| `recording.ts` | `requireAdmin` | `live_input_id` (8-128 chars) |
+| `download-status.ts` | `requireAdmin` | `video_uid` (8-128 chars) |
+| `live-input-status.ts` | `requireAuth` (any logged-in user) | `live_input_id` (8-128 chars) |
+
+`live-input-status` NO requiere admin porque lo usa el polling del VIP en `/vip-live` para detectar OBS.
+
+### Frontend: `authedFetch` helper en `src/lib/api/client.ts`
+
+Nuevo helper que prepend `Authorization: Bearer ${session.access_token}` desde `supabase.auth.getSession()`. Si no hay sesión, tira `ApiError("UNAUTHENTICATED", 401)` antes de salir a la red.
+
+**Call sites migrados** (4 puntos):
+- `src/lib/api/stream/content.ts` → `getDirectUploadUrl`
+- `src/lib/api/stream/lives.ts` → `checkLiveInputStatus`, `fetchRecording`
+- `src/pages/admin/AdminLiveManager.tsx` → `handleDownloadRecording`
+
+### `vercel.json`: headers de seguridad + fix del rewrite
+
+Headers nuevos aplicados a todas las rutas:
+- `X-Frame-Options: DENY` (anti-clickjacking)
+- `X-Content-Type-Options: nosniff` (anti MIME sniffing)
+- `Referrer-Policy: strict-origin-when-cross-origin`
+- `Permissions-Policy: camera=(), microphone=(), geolocation=(), interest-cohort=()`
+- `Strict-Transport-Security: max-age=63072000; includeSubDomains; preload`
+
+**Fix del rewrite**: el catch-all anterior `/(.*)` podía interferir con `/api/*`. Cambiado a `/((?!api/).*)` para que las API routes se manejen primero (Vercel ya lo hace implícito, pero ahora es explícito).
+
+### Env vars nuevas que el admin debe configurar en Vercel
+
+| Variable | Valor sugerido | Entornos |
+|---|---|---|
+| `ALLOWED_ORIGINS` | `https://escuela-riqueza.vercel.app` | Production + Preview + Development |
+
+Opcionalmente: `SUPABASE_URL` y `SUPABASE_ANON_KEY` server-side (sino el helper cae a `VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY` que ya existen).
+
+### Pendiente — rate limit (NO atacado)
+
+Falta integrar rate limit (e.g. Upstash Ratelimit, tier gratis 10k cmds/día) para protegerse de bots que disparen los endpoints en bucle. Recomendado para `upload-url` (3 req/min por user), `live-input-status` (30/min, lo llaman cada 10s desde polling) y `recording/download-status` (10/min).
+
+### Verificación
+- `npm run typecheck` ✅ limpio.
+- Tests existentes no afectados.
+- **Pendiente verificar en producción** tras agregar `ALLOWED_ORIGINS` en Vercel y redeployar.
+
+### Archivos creados/modificados
+
+| Archivo | Cambio |
+|---|---|
+| `api/_lib/auth.ts` | (nuevo) `requireAuth`, `requireAdmin`, `applyCors` |
+| `api/stream/upload-url.ts` | `requireAdmin` + zod + CORS |
+| `api/stream/recording.ts` | `requireAdmin` + zod + CORS |
+| `api/stream/download-status.ts` | `requireAdmin` + zod + CORS |
+| `api/stream/live-input-status.ts` | `requireAuth` + zod + CORS |
+| `src/lib/api/client.ts` | (nuevo) `authedFetch` helper |
+| `src/lib/api/stream/content.ts` | `getDirectUploadUrl` usa `authedFetch` |
+| `src/lib/api/stream/lives.ts` | `checkLiveInputStatus`, `fetchRecording` usan `authedFetch` |
+| `src/pages/admin/AdminLiveManager.tsx` | `handleDownloadRecording` usa `authedFetch` |
+| `vercel.json` | headers de seguridad + fix rewrite |
+
+### Auditoría del estado del proyecto (correcciones a `PROJECT_STATE.md`)
+
+Durante esta sesión se auditó el código vs `docs/PROJECT_STATE.md` y se detectaron varios componentes marcados como "🟡 DECENT" o "🔴 BASIC" que **ya están en estado PREMIUM** en el código. Las correcciones se aplicaron al `PROJECT_STATE.md`. Hallazgos:
+
+| Componente | Decía en PROJECT_STATE | Realidad en código |
+|---|---|---|
+| `Header.tsx` | "🟡 falta menú mobile funcional" | 🟢 `<Sheet>` mobile completo con user card, navegación drill-down al panel, toggle de animaciones, logout |
+| `Footer.tsx` | "🟡 falta gradient/separador animado" | 🟢 gradient dorado, glow radial, redes sociales (IG/YT/FB/WA), tagline cinemático |
+| `LiveChat.tsx` | "🟡 sin entrance/skeleton" | 🟢 `AnimatePresence` en mensajes, Skeleton al cargar, input premium con focus dorado |
+| `AdminContentManager.tsx` | "🟡 sin skeleton/focus" | 🟢 rediseñado en sesión 3 del 14-05 (stats bar, drag-zone con estados, upload progress, reordenar) |
+| `LessonViewer.tsx` (`/leccion`) | "🔴 sin animación" | 🔴 **sigue legacy con mocks hardcodeados** (`upcomingLessons` array, video w3schools placeholder, `isUserPremium = false`). Probable: borrar la ruta — `StudentDashboard` ya hace el drill-down |
+
+### Pendientes reales de diseño (post-auditoría)
+
+1. **Decidir destino de `LessonViewer.tsx`** — borrar ruta `/leccion` (recomendado) o conectarlo a Supabase de verdad.
+2. **`GlobalPodcastPlayer.tsx`** — thumb del slider custom, pulse en barras durante playback, expand/collapse mobile (pendiente desde Fase 5).
+3. **Custom skin sobre `<Stream>` de Cloudflare** para `LessonPlayer` VOD (Fase 5 original).
+4. **`LiveChat.tsx`** — indicador "está escribiendo" (única feature faltante, lo demás está done).
+
+### Cleanup: borrado de `LessonViewer.tsx` legacy
+
+- Eliminada ruta `/leccion` de `routes.tsx`.
+- Eliminado import de `LessonViewer` en `routes.tsx`.
+- Eliminado archivo `src/pages/student/LessonViewer.tsx` (tenía datos mock hardcodeados, video w3schools, `isUserPremium = false`).
+- `StudentDashboard.tsx` ya maneja el drill-down a la lección, así que era código muerto.
+- Verificado: `npm run typecheck` limpio.
+
+### Rate limit con Upstash (helper listo, falta config en cuenta Upstash)
+
+**Qué se agregó:**
+- `api/_lib/ratelimit.ts` — helper `applyRateLimit(req, res, identifier, config)` con sliding window. Singleton de cliente Redis. Cache local de limiters por config. Headers `X-RateLimit-*` + `Retry-After`. **Fail-open** si `UPSTASH_REDIS_REST_URL`/`TOKEN` no están seteados (no bloquea en dev local).
+- Dependencias: `@upstash/ratelimit` + `@upstash/redis`.
+
+**Límites aplicados** (key = `user.id`, prefijo por endpoint):
+
+| Endpoint | Límite | Razón |
+|---|---|---|
+| `upload-url` | 3/min | Admin sube videos infrecuentemente |
+| `recording` | 10/min | Admin |
+| `download-status` | 10/min | Admin |
+| `live-input-status` | 30/min | Polling cada 10s = 6/min, +margen para reconexiones |
+
+**Env vars pendientes que el admin debe configurar en Vercel:**
+- `UPSTASH_REDIS_REST_URL`
+- `UPSTASH_REDIS_REST_TOKEN`
+
+(Ambas se generan al crear un Redis database en upstash.com → tier gratis 10k cmds/día).
+
+**Verificación:** `npm run typecheck` ✅ limpio.
+
+---
+
+## 2026-05-20
+
+### Webhook de Cloudflare Stream para sync OBS ↔ panel admin
+
+**Qué**: nuevo endpoint `api/stream/cloudflare-webhook.ts` que recibe eventos de Cloudflare Stream (a nivel cuenta) y actualiza la tabla `lives` sin polling.
+
+**Por qué**: el polling `/api/stream/live-input-status` se apaga en DEV por diseño y se desactiva permanentemente tras un 500. Webhooks son la forma profesional, sin polling, sin DEV-blindness.
+
+**Eventos manejados**:
+- `live_input.connected` → sala en `scheduled` + `is_active=true` con ese `stream_live_input_id` pasa a `status='live'` automático.
+- `live_input.disconnected` → marca `is_paused=true` (NO finaliza para no perder sesión por microcortes de OBS).
+- `video.ready` con `liveInput` → vincula `recording_stream_uid` si está vacío (auto-vincular grabación al finalizar).
+
+**Seguridad**:
+- Firma HMAC-SHA256 con `CLOUDFLARE_WEBHOOK_SECRET`. Header `Webhook-Signature: time=<ts>,sig1=<hex>`.
+- Anti-replay: rechaza eventos con `time` fuera de ±300s.
+- `timingSafeEqual` para evitar timing attacks.
+- `export const config = { api: { bodyParser: false } }` — Vercel parsea el body por default y eso rompe HMAC porque `JSON.stringify(req.body)` no es idéntico al payload original. Hay que leer el raw body antes de cualquier parse.
+- Usa `SUPABASE_SERVICE_ROLE_KEY` para bypass RLS (webhook no tiene contexto de usuario).
+
+**Setup manual requerido en Cloudflare Dashboard**: configurar Stream → Webhooks con URL del endpoint y guardar el `secret` devuelto en Vercel envs.
+
+**El polling existente se mantiene** como fallback. Webhook + polling = defense-in-depth.
+
+### Rework del aviso del tab "Salas" en `AdminLiveManager`
+
+Pasó de tarjeta horizontal apretada en `text-xs` a info-card vertical con ícono en pill dorado, título `text-sm` semibold y 3 bullets. Mucho más legible especialmente en mobile.
+
+### Rework completo del gestor de contenido admin
+
+**Qué**: `AdminContentManager.tsx` pasó de archivo monolítico de 1005 líneas (lista expandible con formularios inline) a layout master-detail estilo Platzi/Linear, partido en 5 componentes con responsabilidad clara.
+
+**Por qué**: la versión previa mezclaba state, layout y 4 formularios distintos inline. El usuario pidió interfaz más intuitiva, inspirada en sistemas conocidos.
+
+**Estructura nueva**:
+- `src/pages/admin/AdminContentManager.tsx` (~280 líneas, solo orquestación)
+- `src/components/feature/admin-content/PlansSelector.tsx` — checkbox group reutilizable + `PLAN_BADGE_STYLES` export
+- `src/components/feature/admin-content/ModulesSidebar.tsx` — sidebar 320px con búsqueda, selección activa, reorder con flechas en hover
+- `src/components/feature/admin-content/ModuleDetail.tsx` — panel derecho con header del módulo, stats inline, lista de `LessonRow`, CTA crear lección
+- `src/components/feature/admin-content/ModuleFormSheet.tsx` — drawer crear/editar módulo
+- `src/components/feature/admin-content/LessonFormSheet.tsx` — drawer crear/editar lección con upload TUS a Cloudflare e indicador de progreso interno
+
+**Mejoras UX**: búsqueda de módulos (nuevo), edición en drawer lateral en vez de inline, header sobrio sin hero cinematográfico, acciones secundarias en menú `⋮`, tipografía calmada, upload bloquea cierre del drawer mientras sube (antes era posible cerrarlo y romper el progreso).
+
+### Rework del player de live: reemplazo de `@cloudflare/stream-react` por `hls.js` + `<video>` nativo
+
+**Problema acumulado** (reportado por usuario):
+- Buffering/reconexión cada ~5s, "como tratando de reconectar"
+- Calidad baja sin selector — no había forma de elegir 1080p/720p
+- Botón fullscreen no funciona en mobile (especialmente iOS)
+- Sin control sobre buffer ni recovery
+
+**Causa raíz común**: el SDK de Cloudflare encierra todo dentro de un iframe. Sin acceso a `hls.levels[]`, sin recovery configurable (cada stall = reload del manifest), sin acceso al `<video>` element interno (iOS Safari requiere `webkitEnterFullscreen()` sobre el `<video>`, no sobre el wrapper).
+
+**Solución** (`src\components\feature\LiveHLSPlayer.tsx` nuevo + `LivePlayerControls.tsx` reescrito + `VIPLiveRoom.tsx` modificado):
+
+1. **`LiveHLSPlayer`**: componente con `<video>` HTML nativo + `hls.js` apuntando al manifest URL directo `https://customer-XXX.cloudflarestream.com/<input>/manifest/video.m3u8`. Detecta iOS Safari (HLS nativo) vs resto (hls.js polyfill). Cleanup explícito con `hls.destroy()` en useEffect.
+2. **Config hls.js low-latency**: `lowLatencyMode: true`, `liveSyncDuration: 4`, `liveMaxLatencyDuration: 10`, `backBufferLength: 30`, `startLevel: -1` (ABR auto).
+3. **Recovery silencioso**: `NETWORK_ERROR` → `hls.startLoad()`. `MEDIA_ERROR` → `hls.recoverMediaError()` con retry counter (max 2). Solo dispara `onError` si la recuperación falla.
+4. **Selector de calidad**: hls.js expone `hls.levels[]`. Nuevo dropdown en `LivePlayerControls` con menú "Auto / 1080p / 720p / 480p..." usando shadcn `DropdownMenu`. Click forza nivel via `hls.currentLevel = N` (o `-1` para Auto).
+5. **Fullscreen iOS**: `LiveHLSPlayer.enterFullscreen()` detecta iOS Safari y llama `video.webkitEnterFullscreen()` (la única API que iOS soporta), resto usa `requestFullscreen()` standard sobre el wrapper. Listeners `webkitbeginfullscreen` / `webkitendfullscreen` para sync de estado.
+6. **API forwarded**: `LiveHLSPlayerHandle` expone `video`, `enterFullscreen`, `exitFullscreen`, `setQualityLevel`, `getQualityLevels` via `useImperativeHandle`. El parent maneja play/pause/mute directo sobre `livePlayerRef.current?.video`.
+
+**Por qué NO repite el problema de `removeChild` del CHANGELOG 2026-05-16**: no hay iframe. No hay `window.Stream()` mutando DOM por fuera de React. hls.js sólo escribe sobre el `<video>` ref que React controla. Cleanup explícito.
+
+**Dependencia agregada**: `hls.js` (~50KB gzip). Se usa SÓLO para `VIPLiveRoom`. VOD (`LessonPlayer`, `HistoryPage`) sigue con `@cloudflare/stream-react`.
+
+**Verificación**: `npm run typecheck` ✅ limpio.
+

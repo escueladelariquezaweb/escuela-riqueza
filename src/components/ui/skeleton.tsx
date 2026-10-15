@@ -1,0 +1,63 @@
+import type { HTMLAttributes } from "react";
+import { cn } from "@/lib/utils";
+
+type SkeletonVariant = "rect" | "circle" | "text";
+
+interface SkeletonProps extends HTMLAttributes<HTMLDivElement> {
+  variant?: SkeletonVariant;
+}
+
+const variantClasses: Record<SkeletonVariant, string> = {
+  rect: "rounded-xl",
+  circle: "rounded-full aspect-square",
+  text: "rounded-md h-4",
+};
+
+const Skeleton = ({ variant = "rect", className, ...rest }: SkeletonProps) => (
+  <div
+    aria-hidden
+    className={cn(
+      "relative overflow-hidden bg-ink/[0.04] border border-ink/[0.06] light:bg-surface-subtle light:border-line-subtle/70",
+      variantClasses[variant],
+      className,
+    )}
+    {...rest}
+  >
+    <div className="absolute inset-0 -translate-x-full animate-shimmer bg-gradient-to-r from-transparent via-brand/10 light:via-white/80 to-transparent" />
+  </div>
+);
+
+interface SkeletonGroupProps extends HTMLAttributes<HTMLDivElement> {
+  count?: number;
+}
+
+const SkeletonText = ({ count = 3, className, ...rest }: SkeletonGroupProps) => (
+  <div className={cn("flex flex-col gap-2", className)} {...rest}>
+    {Array.from({ length: count }).map((_, i) => (
+      <Skeleton
+        key={i}
+        variant="text"
+        className={i === count - 1 ? "w-2/3" : "w-full"}
+      />
+    ))}
+  </div>
+);
+
+const SkeletonCard = ({ className, ...rest }: HTMLAttributes<HTMLDivElement>) => (
+  <div
+    className={cn(
+      "p-4 sm:p-5 rounded-2xl bg-ink/[0.03] border border-ink/[0.06] light:bg-surface-panel light:border-line-subtle flex flex-col gap-3 sm:gap-4",
+      className,
+    )}
+    {...rest}
+  >
+    <Skeleton variant="rect" className="h-24 sm:h-32 w-full" />
+    <SkeletonText count={2} />
+    <div className="flex items-center justify-between mt-1">
+      <Skeleton variant="text" className="w-1/3" />
+      <Skeleton variant="circle" className="w-8 h-8" />
+    </div>
+  </div>
+);
+
+export { Skeleton, SkeletonText, SkeletonCard };

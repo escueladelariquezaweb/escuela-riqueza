@@ -1,0 +1,214 @@
+import { useState, useEffect } from "react";
+import { Link, NavLink, Outlet, useNavigate } from "react-router-dom";
+import { motion, type Variants } from "motion/react";
+import {
+  LogOut,
+  LayoutDashboard,
+  Video,
+  Users,
+  Settings,
+  Menu,
+  Crown,
+  Radio,
+  Megaphone,
+  Pencil
+} from "lucide-react";
+import { Sheet, SheetContent, SheetTrigger, SheetTitle, SheetDescription } from "@/components/ui/sheet";
+import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
+import BrandLogo from "@/components/layout/BrandLogo";
+import { BRAND_LOGO } from "@/lib/brand";
+import { useAuth } from "@/hooks/useAuth";
+import { useAdminStore } from "@/stores/admin.store";
+
+const sidebarVariants: Variants = {
+  hidden: { x: -20, opacity: 0 },
+  visible: { x: 0, opacity: 1, transition: { duration: 0.5, ease: "easeOut" } },
+};
+
+const navItems = [
+  { icon: LayoutDashboard, label: "Métricas", path: "/admin/metrics" },
+  { icon: Video, label: "Gestor de Contenido", path: "/admin/content" },
+  { icon: Radio, label: "Eventos en Vivo", path: "/admin/lives" },
+  { icon: Megaphone, label: "Aliados", path: "/admin/sponsors" },
+  { icon: Users, label: "Usuarios", path: "/admin/users" },
+  { icon: Settings, label: "Ajustes", path: "/admin/settings" },
+];
+
+const SidebarContent = ({ onNavigate }: { onNavigate?: () => void }) => {
+  const navigate = useNavigate();
+  const { user, signOut } = useAuth();
+  const setEditMode = useAdminStore((s) => s.setEditMode);
+
+  // Entra a la landing YA en modo edición: prende el flag en el store (global)
+  // antes de navegar, así el home monta con los lápices y el banner visibles.
+  const handleEditLanding = () => {
+    if (onNavigate) onNavigate();
+    setEditMode(true);
+    navigate("/");
+  };
+
+  const handleLogout = async () => {
+    if (onNavigate) onNavigate();
+    await signOut();
+    navigate("/login");
+  };
+
+  return (
+    <>
+      <Link to="/" className="px-6 mb-12 flex items-center justify-center pt-8 md:pt-0">
+        <BrandLogo src={BRAND_LOGO} alt="Logo Admin" className="h-14 object-contain drop-shadow-md" />
+      </Link>
+
+      <nav className="flex-1 px-4 space-y-2 overflow-y-auto">
+        {navItems.map((item, idx) => (
+          <NavLink
+            key={idx}
+            to={item.path}
+            onClick={onNavigate}
+            className={({ isActive }) =>
+              cn(
+                "group relative flex items-center gap-3 w-full px-4 py-3.5 font-bold rounded-2xl transition-all overflow-hidden focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus",
+                isActive
+                  ? "bg-brand/10 text-accent border border-brand/20 shadow-inner"
+                  : "text-foreground-muted hover:text-foreground-strong hover:bg-ink/5 border border-transparent font-semibold"
+              )
+            }
+          >
+            {({ isActive }) => (
+              <>
+                {isActive && (
+                  <div className="absolute inset-0 w-full h-full bg-gradient-to-r from-transparent via-brand/10 to-transparent -translate-x-full group-hover:animate-[shimmer_2s_infinite]" />
+                )}
+                <item.icon size={20} className="relative z-10" />
+                <span className="relative z-10">{item.label}</span>
+              </>
+            )}
+          </NavLink>
+        ))}
+      </nav>
+
+      <div className="p-4 mt-auto border-t border-ink/5 space-y-4">
+        <button
+          onClick={handleEditLanding}
+          className="group relative flex items-center w-full px-4 py-3.5 text-foreground-muted hover:text-accent font-semibold rounded-2xl transition-all overflow-hidden border border-transparent hover:border-brand/20 hover:bg-brand/5 hover:shadow-[0_0_15px_rgba(204,164,59,0.1)]"
+        >
+          <div className="absolute inset-0 w-full h-full bg-gradient-to-r from-transparent via-brand/10 to-transparent -translate-x-full group-hover:animate-[shimmer_2s_infinite]" />
+          <Pencil size={18} className="relative z-10 mr-3 transition-transform group-hover:scale-110" />
+          <span className="relative z-10">Editar Landing</span>
+        </button>
+
+        <button
+          onClick={() => {
+            if (onNavigate) onNavigate();
+            navigate("/dashboard");
+          }}
+          className="group relative flex items-center w-full px-4 py-3.5 text-foreground-muted hover:text-accent font-semibold rounded-2xl transition-all overflow-hidden border border-transparent hover:border-brand/20 hover:bg-brand/5 hover:shadow-[0_0_15px_rgba(204,164,59,0.1)]"
+        >
+          <div className="absolute inset-0 w-full h-full bg-gradient-to-r from-transparent via-brand/10 to-transparent -translate-x-full group-hover:animate-[shimmer_2s_infinite]" />
+          <LayoutDashboard size={18} className="relative z-10 mr-3 transition-transform group-hover:scale-110" />
+          <span className="relative z-10">Vista de Alumno</span>
+        </button>
+
+        {/* User Profile Indicator */}
+        <div className="flex items-center gap-3 px-4 py-3 bg-ink/[0.02] light:bg-surface-subtle rounded-2xl border border-ink/5">
+          {user?.avatarUrl ? (
+            <img src={user.avatarUrl} alt={user.fullName} className="w-10 h-10 rounded-full border-2 border-accent shadow-[0_0_15px_rgba(204,164,59,0.4)] shrink-0 object-cover" />
+          ) : (
+            <div className="w-10 h-10 rounded-full bg-gradient-to-tr from-brand to-amber-600 border-2 border-surface-page flex items-center justify-center text-sm font-extrabold text-on-brand shadow-[0_0_15px_rgba(204,164,59,0.4)] shrink-0">
+              {user?.fullName?.substring(0, 2).toUpperCase() || "AD"}
+            </div>
+          )}
+          <div className="overflow-hidden flex-1">
+            <div className="flex items-center gap-1.5">
+              <p className="font-bold text-foreground-strong leading-tight truncate text-sm">{user?.fullName || "Administrador VIP"}</p>
+              <Crown size={14} className="text-accent shrink-0" />
+            </div>
+            <p className="text-[11px] text-accent font-mono truncate">{user?.email || "admin@escuela.com"}</p>
+          </div>
+        </div>
+
+        <button
+          onClick={handleLogout}
+          className="group relative flex items-center w-full px-4 py-3.5 text-foreground-muted hover:text-danger font-semibold rounded-2xl transition-all overflow-hidden border border-transparent hover:border-red-500/20 hover:bg-red-500/5 hover:shadow-[0_0_15px_rgba(239,68,68,0.1)]"
+        >
+          <div className="absolute inset-0 w-full h-full bg-gradient-to-r from-transparent via-red-500/10 to-transparent -translate-x-full group-hover:animate-[shimmer_2s_infinite]" />
+          <LogOut size={18} className="relative z-10 mr-3 transition-transform group-hover:-translate-x-1" />
+          <span className="relative z-10">Cerrar Sesión</span>
+        </button>
+      </div>
+    </>
+  );
+};
+
+const AdminLayout = () => {
+  const [mousePosition, setMousePosition] = useState({ x: 0, y: 0 });
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      setMousePosition({ x: e.clientX, y: e.clientY });
+    };
+    window.addEventListener("mousemove", handleMouseMove);
+    return () => window.removeEventListener("mousemove", handleMouseMove);
+  }, []);
+
+  return (
+    <div className="min-h-[100dvh] bg-gradient-to-br from-[#121212] via-[#1a1710] to-[#0a0a0a] light:from-surface-page light:via-[#f3ead6] light:to-surface-page flex flex-col md:flex-row text-foreground font-sans relative overflow-hidden selection:bg-brand/30">
+      {/* Grid sutil de fondo */}
+      <div className="absolute inset-0 bg-[linear-gradient(to_right,#ffffff0a_1px,transparent_1px),linear-gradient(to_bottom,#ffffff0a_1px,transparent_1px)] light:bg-grid-ink bg-[size:48px_48px] pointer-events-none" />
+
+      {/* Interactividad del mouse (Desktop) */}
+      <motion.div
+        className="pointer-events-none fixed inset-0 z-0 hidden md:block"
+        animate={{
+          background: `radial-gradient(800px circle at ${mousePosition.x}px ${mousePosition.y}px, rgba(204,164,59,0.05), transparent 80%)`,
+        }}
+      />
+
+      {/* Sidebar Desktop */}
+      <motion.aside
+        variants={sidebarVariants}
+        initial="hidden"
+        animate="visible"
+        className="w-64 bg-surface-page/60 backdrop-blur-2xl border-r border-ink/[0.05] flex-col pt-6 min-h-screen shrink-0 relative z-20 hidden md:flex shadow-[4px_0_24px_rgba(0,0,0,0.4)] light:bg-surface-panel/85 light:border-line-subtle light:shadow-[4px_0_24px_-12px_rgba(60,45,15,0.2)]"
+      >
+        <SidebarContent />
+      </motion.aside>
+
+      {/* Topbar Mobile */}
+      <div className="md:hidden flex items-center justify-between p-4 bg-surface-page/80 backdrop-blur-md border-b border-ink/[0.05] relative z-20">
+        <BrandLogo src={BRAND_LOGO} alt="Logo Admin" className="h-8 object-contain" />
+        <Sheet open={isMobileMenuOpen} onOpenChange={setIsMobileMenuOpen}>
+          <SheetTrigger asChild>
+            <Button variant="ghost" size="icon" className="text-foreground-strong hover:bg-ink/10 w-11 h-11 focus-visible:ring-2 focus-visible:ring-focus" aria-label="Menú admin">
+              <Menu size={24} />
+            </Button>
+          </SheetTrigger>
+          <SheetContent side="left" className="w-[280px] p-0 bg-surface-page/95 backdrop-blur-2xl border-r border-ink/[0.05] flex flex-col">
+            <SheetTitle className="sr-only">Menú de Administración</SheetTitle>
+            <SheetDescription className="sr-only">Navegación del panel administrativo.</SheetDescription>
+            <SidebarContent onNavigate={() => setIsMobileMenuOpen(false)} />
+          </SheetContent>
+        </Sheet>
+      </div>
+
+      {/* Main Content Area */}
+      <main data-lenis-prevent className="flex-1 p-4 sm:p-6 md:p-8 lg:p-12 relative z-10 overflow-y-auto md:h-[100dvh] w-full flex flex-col min-h-0">
+        {/* Orbe flotante en el main — solo desktop (perf mobile) */}
+        <motion.div
+          animate={{ y: [0, -20, 0], scale: [1, 1.05, 1], opacity: [0.1, 0.15, 0.1] }}
+          transition={{ duration: 10, repeat: Infinity, ease: "easeInOut" }}
+          className="hidden md:block absolute top-[10%] right-[10%] -z-10 w-[500px] h-[500px] rounded-full bg-brand blur-[120px] pointer-events-none"
+        />
+
+        {/* Outlet renderiza la vista activa (Upload, Metrics, etc) */}
+        <div className="flex-1 w-full max-w-6xl mx-auto">
+          <Outlet />
+        </div>
+      </main>
+    </div>
+  );
+};
+
+export default AdminLayout;

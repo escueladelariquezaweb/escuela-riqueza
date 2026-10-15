@@ -1,0 +1,362 @@
+import { useState } from "react";
+import { Reorder, useDragControls } from "motion/react";
+import {
+  Edit2, Trash2, Eye, EyeOff, Plus, PlayCircle, AlertCircle,
+  MoreVertical, Film, GripVertical, Loader2, Check
+} from "lucide-react";
+import { cn } from "@/lib/utils";
+import {
+  DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem,
+  DropdownMenuSeparator
+} from "@/components/ui/dropdown-menu";
+import type { Module, Lesson } from "@/lib/api/stream/content";
+import { PLAN_BADGE_STYLES, type Plan } from "./PlansSelector";
+
+interface ModuleDetailProps {
+  module: Module;
+  lessons: Lesson[];
+  onEditModule: () => void;
+  onTogglePublishModule: () => void;
+  onDeleteModule: () => void;
+  onCreateLesson: () => void;
+  onEditLesson: (lesson: Lesson) => void;
+  onTogglePublishLesson: (lesson: Lesson) => void;
+  onDeleteLesson: (lesson: Lesson) => void;
+  /** Se dispara en cada swap del arrastre — solo actualiza el orden en memoria. */
+  onReorderLessons: (ordered: Lesson[]) => void;
+  /** Se dispara al soltar (o tras mover con teclado) — persiste el orden. */
+  onCommitLessonOrder: () => void;
+  orderStatus: "idle" | "saving" | "saved";
+}
+
+export const ModuleDetail = ({
+  module,
+  lessons,
+  onEditModule,
+  onTogglePublishModule,
+  onDeleteModule,
+  onCreateLesson,
+  onEditLesson,
+  onTogglePublishLesson,
+  onDeleteLesson,
+  onReorderLessons,
+  onCommitLessonOrder,
+  orderStatus,
+}: ModuleDetailProps) => {
+  const publishedCount = lessons.filter((l) => l.is_published).length;
+  const withVideoCount = lessons.filter((l) => l.stream_uid).length;
+
+  const moveByKeyboard = (index: number, direction: "up" | "down") => {
+    const target = direction === "up" ? index - 1 : index + 1;
+    if (target < 0 || target >= lessons.length) return;
+    const next = [...lessons];
+    [next[index], next[target]] = [next[target], next[index]];
+    onReorderLessons(next);
+    onCommitLessonOrder();
+  };
+
+  const canReorder = lessons.length > 1;
+
+  return (
+    <div className="flex-1 flex flex-col bg-surface-page/40 border border-ink/5 rounded-2xl overflow-hidden min-w-0">
+      <header className="p-6 border-b border-ink/5">
+        <div className="flex items-start justify-between gap-4 mb-4">
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2 mb-2">
+              <span
+                className={cn(
+                  "text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded",
+                  module.is_published
+                    ? "bg-green-500/15 text-green-300 light:text-success border border-green-500/30"
+                    : "bg-ink/5 text-fg-60 border border-line-subtle"
+                )}
+              >
+                {module.is_published ? "Publicado" : "Borrador"}
+              </span>
+              {module.allowed_plans?.map((plan) => (
+                <span
+                  key={plan}
+                  className={cn(
+                    "text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded capitalize",
+                    PLAN_BADGE_STYLES[plan as Plan]
+                  )}
+                >
+                  {plan}
+                </span>
+              ))}
+            </div>
+            <h1 className="text-2xl font-bold text-foreground-strong tracking-tight mb-1.5">{module.title}</h1>
+            {module.description && (
+              <p className="text-sm text-foreground-muted leading-relaxed line-clamp-2">{module.description}</p>
+            )}
+          </div>
+
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              onClick={onEditModule}
+              className="flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-fg-70 hover:text-foreground-strong bg-ink/5 hover:bg-ink/10 rounded-lg transition-colors"
+            >
+              <Edit2 size={14} />
+              <span className="hidden sm:inline">Editar</span>
+            </button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  className="p-2 text-fg-60 hover:text-foreground-strong bg-ink/5 hover:bg-ink/10 rounded-lg transition-colors"
+                  aria-label="Más acciones del módulo"
+                >
+                  <MoreVertical size={16} />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem onClick={onTogglePublishModule}>
+                  {module.is_published ? (
+                    <><EyeOff size={14} className="mr-2" /> Ocultar módulo</>
+                  ) : (
+                    <><Eye size={14} className="mr-2" /> Publicar módulo</>
+                  )}
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem onClick={onDeleteModule} className="text-danger focus:text-red-300">
+                  <Trash2 size={14} className="mr-2" /> Eliminar módulo
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-5 text-xs text-foreground-muted flex-wrap">
+          <span className="flex items-center gap-1.5">
+            <Film size={13} className="text-fg-40" />
+            <strong className="text-foreground-strong font-semibold">{lessons.length}</strong> lecciones
+          </span>
+          <span className="flex items-center gap-1.5">
+            <Eye size={13} className="text-fg-40" />
+            <strong className="text-foreground-strong font-semibold">{publishedCount}</strong> publicadas
+          </span>
+          <span className="flex items-center gap-1.5">
+            <PlayCircle size={13} className="text-fg-40" />
+            <strong className="text-foreground-strong font-semibold">{withVideoCount}</strong> con video
+          </span>
+
+          {canReorder && (
+            <span className="sm:ml-auto flex items-center gap-1.5" aria-live="polite">
+              {orderStatus === "saving" ? (
+                <>
+                  <Loader2 size={12} className="text-accent animate-spin" />
+                  <span className="text-accent font-semibold">Guardando orden…</span>
+                </>
+              ) : orderStatus === "saved" ? (
+                <>
+                  <Check size={12} className="text-green-400 light:text-success" />
+                  <span className="text-green-300 light:text-success font-semibold">Orden guardado</span>
+                </>
+              ) : (
+                <>
+                  <GripVertical size={12} className="text-fg-30" />
+                  <span>Arrastra para reordenar</span>
+                </>
+              )}
+            </span>
+          )}
+        </div>
+      </header>
+
+      <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-2 min-h-0">
+        {lessons.length === 0 ? (
+          <div className="text-center py-16 px-6 bg-ink/[0.01] border border-dashed border-line-subtle rounded-xl light:bg-surface-panel/60">
+            <Film size={36} className="mx-auto text-fg-15 mb-4" />
+            <p className="text-fg-60 font-medium mb-1">Este módulo está vacío</p>
+            <p className="text-sm text-foreground-muted mb-5">Agrega la primera lección para empezar.</p>
+            <button
+              onClick={onCreateLesson}
+              className="inline-flex items-center gap-1.5 px-4 py-2 bg-brand hover:bg-brand-hover text-black text-sm font-semibold rounded-lg transition-colors"
+            >
+              <Plus size={15} strokeWidth={2.5} /> Añadir lección
+            </button>
+          </div>
+        ) : (
+          <>
+            <Reorder.Group
+              axis="y"
+              values={lessons}
+              onReorder={onReorderLessons}
+              className="list-none space-y-2 m-0 p-0"
+            >
+              {lessons.map((lesson, idx) => (
+                <LessonRow
+                  key={lesson.id}
+                  lesson={lesson}
+                  index={idx}
+                  canReorder={canReorder}
+                  isFirst={idx === 0}
+                  isLast={idx === lessons.length - 1}
+                  onDropped={onCommitLessonOrder}
+                  onMoveKeyboard={(dir) => moveByKeyboard(idx, dir)}
+                  onEdit={() => onEditLesson(lesson)}
+                  onTogglePublish={() => onTogglePublishLesson(lesson)}
+                  onDelete={() => onDeleteLesson(lesson)}
+                />
+              ))}
+            </Reorder.Group>
+            <button
+              onClick={onCreateLesson}
+              className="mt-3 w-full flex items-center justify-center gap-2 py-3 border border-dashed border-line-subtle rounded-xl text-fg-50 hover:text-accent hover:border-brand/30 hover:bg-gold/[0.03] transition-all text-sm font-semibold"
+            >
+              <Plus size={16} /> Añadir lección
+            </button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+};
+
+interface LessonRowProps {
+  lesson: Lesson;
+  index: number;
+  canReorder: boolean;
+  isFirst: boolean;
+  isLast: boolean;
+  onDropped: () => void;
+  onMoveKeyboard: (direction: "up" | "down") => void;
+  onEdit: () => void;
+  onTogglePublish: () => void;
+  onDelete: () => void;
+}
+
+const LessonRow = ({
+  lesson,
+  index,
+  canReorder,
+  isFirst,
+  isLast,
+  onDropped,
+  onMoveKeyboard,
+  onEdit,
+  onTogglePublish,
+  onDelete,
+}: LessonRowProps) => {
+  const dragControls = useDragControls();
+  const [dragging, setDragging] = useState(false);
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (!canReorder) return;
+    if (e.key === "ArrowUp" && !isFirst) {
+      e.preventDefault();
+      onMoveKeyboard("up");
+    } else if (e.key === "ArrowDown" && !isLast) {
+      e.preventDefault();
+      onMoveKeyboard("down");
+    }
+  };
+
+  return (
+    <Reorder.Item
+      value={lesson}
+      dragListener={false}
+      dragControls={dragControls}
+      onDragStart={() => setDragging(true)}
+      onDragEnd={() => { setDragging(false); onDropped(); }}
+      whileDrag={{ scale: 1.015 }}
+      style={{ position: "relative" }}
+      className={cn(
+        "group flex items-center gap-2 sm:gap-3 p-3 rounded-xl border transition-colors select-none",
+        dragging
+          ? "z-30 bg-brand/[0.07] border-brand/40 shadow-2xl shadow-black/60 light:bg-surface-panel light:shadow-[0_18px_40px_-16px_rgba(60,45,15,0.4)] cursor-grabbing"
+          : lesson.is_published
+            ? "bg-ink/[0.02] border-ink/5 hover:bg-ink/[0.04] hover:border-line-subtle light:bg-surface-panel light:border-line-subtle light:hover:bg-surface-panel light:hover:shadow-sm"
+            : "bg-transparent border-dashed border-line-subtle opacity-70 hover:opacity-100 light:bg-surface-panel/50"
+      )}
+    >
+      <button
+        type="button"
+        disabled={!canReorder}
+        // Sin preventDefault: el handle debe recibir foco para que funcionen ↑ / ↓.
+        onPointerDown={(e) => { e.currentTarget.focus(); dragControls.start(e); }}
+        onKeyDown={handleKeyDown}
+        title="Arrastra para reordenar (o usa ↑ ↓)"
+        aria-label={`Reordenar "${lesson.title}". Posición ${index + 1}. Usa las flechas arriba y abajo para moverla.`}
+        className={cn(
+          "shrink-0 -ml-1 p-1 rounded-md touch-none transition-colors",
+          "text-fg-25 hover:text-accent hover:bg-ink/5 cursor-grab active:cursor-grabbing",
+          "focus:outline-none focus-visible:ring-2 focus-visible:ring-focus/50 focus-visible:text-accent",
+          "disabled:opacity-0 disabled:cursor-default disabled:pointer-events-none"
+        )}
+      >
+        <GripVertical size={16} />
+      </button>
+
+      <span
+        className={cn(
+          "shrink-0 w-8 h-8 rounded-lg flex items-center justify-center text-xs font-bold font-mono",
+          lesson.is_published ? "bg-brand/10 text-accent border border-brand/20" : "bg-ink/5 text-fg-40"
+        )}
+      >
+        {String(index + 1).padStart(2, "0")}
+      </span>
+
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2 mb-1">
+          <p className="text-sm font-semibold text-foreground-strong truncate min-w-0">{lesson.title}</p>
+          {!lesson.is_published && (
+            <span className="shrink-0 text-[9px] font-bold uppercase tracking-wider bg-ink/5 text-fg-50 px-1.5 py-0.5 rounded">
+              Borrador
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-2 flex-wrap">
+          {lesson.stream_uid ? (
+            <span className="flex items-center gap-1 text-[10px] font-semibold text-green-300 light:text-success bg-green-500/10 border border-green-500/20 px-1.5 py-0.5 rounded">
+              <PlayCircle size={10} /> Video listo
+            </span>
+          ) : (
+            <span className="flex items-center gap-1 text-[10px] font-semibold text-amber-300 light:text-warning bg-amber-500/10 border border-amber-500/20 px-1.5 py-0.5 rounded">
+              <AlertCircle size={10} /> Sin video
+            </span>
+          )}
+          {lesson.allowed_plans?.map((plan) => (
+            <span
+              key={plan}
+              className={cn(
+                "text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded capitalize",
+                PLAN_BADGE_STYLES[plan as Plan]
+              )}
+            >
+              {plan}
+            </span>
+          ))}
+        </div>
+      </div>
+
+      <div className="flex items-center gap-1 shrink-0 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+        <button
+          onClick={onTogglePublish}
+          className={cn(
+            "p-2 rounded-lg transition-colors",
+            lesson.is_published
+              ? "text-fg-50 hover:text-foreground-strong hover:bg-ink/10"
+              : "text-warning hover:bg-amber-500/15"
+          )}
+          aria-label={lesson.is_published ? "Ocultar" : "Publicar"}
+        >
+          {lesson.is_published ? <Eye size={15} /> : <EyeOff size={15} />}
+        </button>
+        <button
+          onClick={onEdit}
+          className="p-2 text-fg-50 hover:text-foreground-strong hover:bg-ink/10 rounded-lg transition-colors"
+          aria-label="Editar"
+        >
+          <Edit2 size={15} />
+        </button>
+        <button
+          onClick={onDelete}
+          className="p-2 text-fg-50 hover:text-danger hover:bg-red-500/10 rounded-lg transition-colors"
+          aria-label="Eliminar"
+        >
+          <Trash2 size={15} />
+        </button>
+      </div>
+    </Reorder.Item>
+  );
+};

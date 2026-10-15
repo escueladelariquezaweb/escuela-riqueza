@@ -1,0 +1,664 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { motion, AnimatePresence } from "motion/react";
+import { AlertTriangle, ArrowLeft, Loader2, Lock, MessageSquare, Pin, PinOff, RotateCw, Send, Trash2, CornerDownRight } from "lucide-react";
+import { supabase } from "@/lib/supabase";
+import { toast } from "@/components/ui/toaster";
+import { cn } from "@/lib/utils";
+import { scrollToElement } from "@/lib/smoothScroll";
+import {
+  createComment,
+  deleteComment,
+  deletePost,
+  fetchComments,
+  fetchPost,
+  togglePinPost,
+  type CommunityComment,
+  type CommunityPost,
+} from "@/lib/api/community";
+import { LikeButton } from "./LikeButton";
+import { AuthorAvatar } from "./AuthorAvatar";
+import { ConfirmDialog } from "./ConfirmDialog";
+import { authorName, categoryMeta, formatRelative, mergeComments } from "./community-utils";
+
+interface PostDetailProps {
+  postId: string;
+  currentUserId: string;
+  isAdmin: boolean;
+  canWrite: boolean;
+  onBack: () => void;
+  onDeleted: () => void;
+  /** "comments": al terminar de cargar, desliza hasta los comentarios. */
+  initialSection?: "top" | "comments";
+}
+
+export function PostDetail({ postId, currentUserId, isAdmin, canWrite, onBack, onDeleted, initialSection = "top" }: PostDetailProps) {
+  const navigate = useNavigate();
+  const [post, setPost] = useState<CommunityPost | null>(null);
+  const [comments, setComments] = useState<CommunityComment[]>([]);
+  // "notfound" (eliminada o inexistente) y "error" (falló la lectura) son
+  // distintos: antes ambos decían "No se encontró la publicación".
+  const [status, setStatus] = useState<"loading" | "ready" | "notfound" | "error">("loading");
+  const [reloadKey, setReloadKey] = useState(0);
+  const [body, setBody] = useState("");
+  const [replyTo, setReplyTo] = useState<CommunityComment | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [confirmingPostDelete, setConfirmingPostDelete] = useState(false);
+  const [pendingCommentDelete, setPendingCommentDelete] = useState<string | null>(null);
+  const replyInputRef = useRef<HTMLTextAreaElement>(null);
+  const commentsRef = useRef<HTMLElement>(null);
+  // Una sola vez por publicación: un refresco posterior no vuelve a mover la página.
+  const scrolledForPostRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setStatus("loading");
+      try {
+        const [p, c] = await Promise.all([fetchPost(postId), fetchComments(postId)]);
+        if (cancelled) return;
+        setPost(p);
+        setComments(c);
+        setStatus(p ? "ready" : "notfound");
+      } catch {
+        if (!cancelled) setStatus("error");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [postId, reloadKey]);
+
+  useEffect(() => {
+    const channel = supabase
+      .channel(`community_post_${postId}`)
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "community_comments", filter: `post_id=eq.${postId}` },
+        async () => {
+          try {
+            const fetched = await fetchComments(postId);
+            setComments((prev) => mergeComments(fetched, prev));
+          } catch {
+            // Sin red: la lista a la vista se conserva; el próximo evento reintenta.
+          }
+        }
+      )
+      .on(
+        "postgres_changes",
+        { event: "DELETE", schema: "public", table: "community_comments", filter: `post_id=eq.${postId}` },
+        (payload) => {
+          const oldId = (payload.old as { id?: string }).id;
+          if (oldId) setComments((prev) => prev.filter((c) => c.id !== oldId && c.parent_id !== oldId));
+        }
+      )
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "community_comments", filter: `post_id=eq.${postId}` },
+        (payload) => {
+          const updated = payload.new as Partial<CommunityComment>;
+          setComments((prev) =>
+            prev.map((c) => {
+              if (c.id === updated.id) {
+                return {
+                  ...c,
+                  ...updated,
+                  author: c.author,
+                  liked_by_me: c.liked_by_me,
+                };
+              }
+              return c;
+            })
+          );
+        }
+      )
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "community_posts", filter: `id=eq.${postId}` },
+        (payload) => {
+          const updated = payload.new as Partial<CommunityPost>;
+          setPost((prev) => {
+            if (!prev) return prev;
+            return {
+              ...prev,
+              ...updated,
+              author: prev.author,
+              liked_by_me: prev.liked_by_me,
+            };
+          });
+        }
+      )
+      .subscribe();
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [postId]);
+
+  // Abierta desde "comentarios": recién con el contenido cargado existe el
+  // destino; antes la página quedaba donde estaba la tarjeta (a veces el footer).
+  useEffect(() => {
+    if (status !== "ready" || initialSection !== "comments") return;
+    if (scrolledForPostRef.current === postId || !commentsRef.current) return;
+    scrolledForPostRef.current = postId;
+    scrollToElement(commentsRef.current);
+  }, [status, initialSection, postId]);
+
+  const tree = useMemo(() => {
+    const roots: CommunityComment[] = [];
+    const childrenMap = new Map<string, CommunityComment[]>();
+    for (const c of comments) {
+      if (c.parent_id) {
+        const arr = childrenMap.get(c.parent_id) ?? [];
+        arr.push(c);
+        childrenMap.set(c.parent_id, arr);
+      } else {
+        roots.push(c);
+      }
+    }
+    return { roots, childrenMap };
+  }, [comments]);
+
+  const handleDeletePost = async () => {
+    if (!post) return;
+    try {
+      await deletePost(post.id);
+      toast.success("Publicación eliminada");
+      onDeleted();
+    } catch (err) {
+      console.error(err);
+      toast.error("No se pudo eliminar");
+      throw err;
+    }
+  };
+
+  const handleTogglePin = async () => {
+    if (!post) return;
+    try {
+      const next = !post.is_pinned;
+      await togglePinPost(post.id, next);
+      setPost({ ...post, is_pinned: next });
+      toast.success(next ? "Publicación fijada" : "Publicación desfijada");
+    } catch (err) {
+      console.error(err);
+      toast.error("No se pudo actualizar");
+    }
+  };
+
+  const handleDeleteComment = async () => {
+    const id = pendingCommentDelete;
+    if (!id) return;
+    try {
+      await deleteComment(id);
+      setComments((prev) => prev.filter((c) => c.id !== id && c.parent_id !== id));
+    } catch (err) {
+      console.error(err);
+      toast.error("No se pudo eliminar el comentario");
+      throw err;
+    }
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const txt = body.trim();
+    if (txt.length < 1 || submitting) return;
+    setSubmitting(true);
+    try {
+      const comment = await createComment({
+        postId,
+        body: txt,
+        parentId: replyTo?.parent_id ? replyTo.parent_id : replyTo?.id ?? null,
+      });
+      // El realtime puede haberlo traído antes que esta respuesta.
+      setComments((prev) => (prev.some((c) => c.id === comment.id) ? prev : [...prev, comment]));
+      setBody("");
+      setReplyTo(null);
+    } catch (err) {
+      console.error(err);
+      toast.error("No se pudo publicar el comentario");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const startReply = (c: CommunityComment) => {
+    setReplyTo(c);
+    setTimeout(() => replyInputRef.current?.focus(), 50);
+  };
+
+  if (status === "loading") {
+    return (
+      <div className="flex items-center justify-center py-24" role="status" aria-label="Cargando publicación">
+        <Loader2 className="animate-spin text-accent" size={32} aria-hidden />
+      </div>
+    );
+  }
+
+  if (status === "error") {
+    return (
+      <div role="alert" className="py-20 text-center">
+        <AlertTriangle className="mx-auto mb-3 text-red-400 light:text-danger" size={28} aria-hidden />
+        <p className="font-semibold text-foreground-strong">No pudimos cargar la publicación</p>
+        <p className="mt-1 text-sm text-foreground-muted">Revisa tu conexión e inténtalo de nuevo.</p>
+        <div className="mt-5 flex items-center justify-center gap-3">
+          <button
+            type="button"
+            onClick={() => setReloadKey((k) => k + 1)}
+            className="inline-flex min-h-11 items-center gap-2 rounded-xl bg-brand px-5 font-bold text-on-brand transition-colors hover:bg-brand-hover"
+          >
+            <RotateCw size={16} aria-hidden /> Reintentar
+          </button>
+          <button type="button" onClick={onBack} className="min-h-11 px-3 text-accent hover:underline">
+            Volver al foro
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!post) {
+    return (
+      <div className="py-20 text-center">
+        <p className="text-foreground-muted">Esta publicación ya no existe o fue eliminada.</p>
+        <button type="button" onClick={onBack} className="mt-4 min-h-11 text-accent hover:underline">
+          Volver al foro
+        </button>
+      </div>
+    );
+  }
+
+  const cat = categoryMeta(post.category);
+  const CatIcon = cat.icon;
+  const canDeletePost = isAdmin || post.author_id === currentUserId;
+  const isPostAuthorAdmin = post.author?.role === "admin";
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.3 }}
+      className="space-y-6"
+    >
+      <button
+        type="button"
+        onClick={onBack}
+        className="group inline-flex items-center gap-2 text-sm text-foreground-muted transition-colors hover:text-accent"
+      >
+        <ArrowLeft size={16} className="transition-transform group-hover:-translate-x-1" />
+        Volver al foro
+      </button>
+
+      {/* Post hero */}
+      <motion.article
+        layout
+        className={cn(
+          "relative overflow-hidden rounded-3xl border bg-surface-page/60 light:bg-surface-panel light:shadow-panel transition-all",
+          post.is_pinned
+            ? "border-brand/40 shadow-[0_12px_48px_-20px_rgba(204,164,59,0.55)]"
+            : "border-line-subtle"
+        )}
+      >
+        {post.is_pinned && (
+          <div className="absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-transparent via-brand to-transparent" />
+        )}
+        <div className="pointer-events-none absolute -top-32 -right-20 h-64 w-64 rounded-full bg-brand/10 blur-3xl" />
+
+        <div className="relative p-6 sm:p-8">
+          <header className="mb-5 flex items-start gap-4">
+            <AuthorAvatar author={post.author} size="xl" />
+
+            <div className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-sm">
+                <span className="font-semibold text-foreground-strong">{authorName(post.author)}</span>
+                {isPostAuthorAdmin && (
+                  <span className="rounded-full bg-brand/15 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-accent ring-1 ring-focus/30">
+                    Admin
+                  </span>
+                )}
+                <span className="text-xs text-foreground-muted">· {formatRelative(post.created_at)}</span>
+              </div>
+              <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                <span
+                  className={cn(
+                    "inline-flex items-center gap-1 rounded-full border bg-gradient-to-r px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide",
+                    cat.chip
+                  )}
+                >
+                  <CatIcon size={10} />
+                  {cat.label}
+                </span>
+                {post.is_pinned && (
+                  <span className="inline-flex items-center gap-1 rounded-full bg-brand/15 px-2 py-0.5 text-[10px] font-bold uppercase text-accent ring-1 ring-focus/30">
+                    <Pin size={10} /> Fijado
+                  </span>
+                )}
+              </div>
+            </div>
+
+            {(canDeletePost || isAdmin) && (
+              <div className="flex shrink-0 items-center gap-1">
+                {isAdmin && (
+                  <button
+                    type="button"
+                    onClick={handleTogglePin}
+                    aria-label={post.is_pinned ? "Desfijar publicación" : "Fijar publicación"}
+                    aria-pressed={post.is_pinned}
+                    className={cn(
+                      "inline-flex min-h-11 items-center gap-1 rounded-lg px-2.5 text-xs transition-colors",
+                      post.is_pinned
+                        ? "bg-brand/15 text-accent ring-1 ring-focus/30 hover:bg-brand/20"
+                        : "text-foreground-muted hover:bg-ink/5 hover:text-accent"
+                    )}
+                  >
+                    {post.is_pinned ? <PinOff size={14} /> : <Pin size={14} />}
+                    <span className="hidden sm:inline">{post.is_pinned ? "Desfijar" : "Fijar"}</span>
+                  </button>
+                )}
+                {canDeletePost && (
+                  <button
+                    type="button"
+                    onClick={() => setConfirmingPostDelete(true)}
+                    aria-label="Eliminar publicación"
+                    className="inline-flex min-h-11 items-center gap-1 rounded-lg px-2.5 text-xs text-danger transition-colors hover:bg-red-500/10 hover:text-red-300 light:hover:text-danger"
+                  >
+                    <Trash2 size={14} />
+                    <span className="hidden sm:inline">Eliminar</span>
+                  </button>
+                )}
+              </div>
+            )}
+          </header>
+
+          <h2 className="mb-4 text-2xl font-extrabold leading-tight text-foreground-strong sm:text-3xl">
+            {post.title}
+          </h2>
+          <div className="whitespace-pre-wrap text-[15px] leading-relaxed text-foreground sm:text-base">
+            {post.body}
+          </div>
+
+          {post.image_url && (
+            <div className="mt-5 overflow-hidden rounded-2xl border border-line-subtle bg-black">
+              <img
+                src={post.image_url}
+                alt={`Imagen adjunta a «${post.title}»`}
+                className="w-full max-h-[600px] object-contain"
+              />
+            </div>
+          )}
+
+          <div className="mt-5 flex items-center gap-1 border-t border-ink/5 pt-4">
+            <LikeButton
+              targetType="post"
+              targetId={post.id}
+              liked={post.liked_by_me ?? false}
+              count={post.like_count}
+              readOnly={!canWrite}
+            />
+            <div className="inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-sm text-foreground-muted">
+              <MessageSquare size={15} />
+              <span className="font-semibold tabular-nums">{comments.length}</span>
+              <span className="hidden sm:inline">
+                {comments.length === 1 ? "Comentario" : "Comentarios"}
+              </span>
+            </div>
+          </div>
+        </div>
+      </motion.article>
+
+      {/* Comments */}
+      <section ref={commentsRef} aria-label="Comentarios">
+        <h3 className="mb-4 flex items-center gap-2 text-lg font-bold text-foreground-strong">
+          <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-brand/15 text-accent ring-1 ring-focus/30">
+            <MessageSquare size={14} />
+          </span>
+          Comentarios
+          <span className="text-sm font-semibold text-foreground-muted">({comments.length})</span>
+        </h3>
+
+        {/* Composer */}
+        {!canWrite ? (
+          <div className="mb-6 flex flex-col items-start gap-3 rounded-2xl border border-brand/30 bg-brand/[0.08] p-5 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-start gap-3">
+              <span className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-brand/15 text-accent ring-1 ring-focus/30">
+                <Lock size={16} />
+              </span>
+              <div>
+                <h4 className="font-bold text-foreground-strong">Estás viendo la comunidad en modo lectura</h4>
+                <p className="mt-0.5 text-sm text-foreground-muted">
+                  Con el plan Individual o VIP puedes publicar, comentar y reaccionar.
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => navigate("/planes")}
+              className="shrink-0 self-start rounded-xl bg-brand px-5 py-2.5 text-sm font-bold text-on-brand transition-colors hover:bg-brand-hover sm:self-auto"
+            >
+              Ver planes
+            </button>
+          </div>
+        ) : (
+        <form
+          onSubmit={handleSubmit}
+          className="mb-6 overflow-hidden rounded-2xl border border-line-subtle bg-gradient-to-br from-white/[0.04] to-white/[0.01] light:bg-none light:bg-surface-panel transition-colors focus-within:border-brand/40"
+        >
+          <AnimatePresence>
+            {replyTo && (
+              <motion.div
+                initial={{ opacity: 0, height: 0 }}
+                animate={{ opacity: 1, height: "auto" }}
+                exit={{ opacity: 0, height: 0 }}
+                className="overflow-hidden"
+              >
+                <div className="flex items-center justify-between gap-3 border-b border-brand/20 bg-gold/[0.08] px-4 py-2.5 text-xs">
+                  <span className="inline-flex items-center gap-2 text-foreground-muted">
+                    <CornerDownRight size={13} className="text-accent" />
+                    Respondiendo a <strong className="text-accent">{authorName(replyTo.author)}</strong>
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setReplyTo(null)}
+                    className="text-foreground-muted transition-colors hover:text-foreground-strong"
+                  >
+                    Cancelar
+                  </button>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+          <label htmlFor={`comment-composer-${postId}`} className="sr-only">
+            {replyTo ? `Respuesta a ${authorName(replyTo.author)}` : "Tu comentario"}
+          </label>
+          <textarea
+            id={`comment-composer-${postId}`}
+            ref={replyInputRef}
+            value={body}
+            onChange={(e) => setBody(e.target.value)}
+            maxLength={5000}
+            rows={3}
+            placeholder={replyTo ? "Escribe tu respuesta…" : "Comparte tu opinión con la comunidad…"}
+            className="w-full resize-y bg-transparent px-4 py-3 text-foreground-strong placeholder:text-foreground-muted focus:outline-none"
+          />
+          <div className="flex items-center justify-between border-t border-ink/5 bg-black/20 light:bg-surface-subtle px-4 py-2.5">
+            <span className="text-[10px] text-foreground-muted/70 tabular-nums">{body.length} / 5.000</span>
+            <motion.button
+              type="submit"
+              whileTap={{ scale: 0.95 }}
+              disabled={submitting || body.trim().length === 0}
+              className="inline-flex items-center gap-2 rounded-xl bg-brand px-4 py-2 text-sm font-bold text-on-brand transition-colors hover:bg-brand-hover disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {submitting ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
+              {replyTo ? "Responder" : "Comentar"}
+            </motion.button>
+          </div>
+        </form>
+        )}
+
+        {/* Threaded list */}
+        {tree.roots.length === 0 ? (
+          <div className="rounded-2xl border border-dashed border-line-subtle py-12 text-center">
+            <MessageSquare size={28} className="mx-auto mb-3 text-foreground-muted/40" />
+            <p className="text-sm text-foreground-muted">Aún no hay comentarios. Sé el primero.</p>
+          </div>
+        ) : (
+          <motion.div layout className="space-y-3">
+            <AnimatePresence initial={false}>
+              {tree.roots.map((c) => (
+                <CommentNode
+                  key={c.id}
+                  comment={c}
+                  replies={tree.childrenMap.get(c.id) ?? []}
+                  currentUserId={currentUserId}
+                  isAdmin={isAdmin}
+                  canWrite={canWrite}
+                  onReply={startReply}
+                  onDelete={setPendingCommentDelete}
+                />
+              ))}
+            </AnimatePresence>
+          </motion.div>
+        )}
+      </section>
+
+      <ConfirmDialog
+        open={confirmingPostDelete}
+        onOpenChange={setConfirmingPostDelete}
+        title="¿Eliminar esta publicación?"
+        description="Se eliminarán también todos sus comentarios. No se puede deshacer."
+        confirmLabel="Eliminar"
+        onConfirm={handleDeletePost}
+      />
+      <ConfirmDialog
+        open={pendingCommentDelete !== null}
+        onOpenChange={(open) => { if (!open) setPendingCommentDelete(null); }}
+        title="¿Eliminar este comentario?"
+        description="Si tiene respuestas, también se eliminarán."
+        confirmLabel="Eliminar"
+        onConfirm={handleDeleteComment}
+      />
+    </motion.div>
+  );
+}
+
+interface CommentNodeProps {
+  comment: CommunityComment;
+  replies: CommunityComment[];
+  currentUserId: string;
+  isAdmin: boolean;
+  canWrite: boolean;
+  onReply: (c: CommunityComment) => void;
+  onDelete: (id: string) => void;
+}
+
+function CommentNode({ comment, replies, currentUserId, isAdmin, canWrite, onReply, onDelete }: CommentNodeProps) {
+  return (
+    <motion.div
+      layout
+      initial={{ opacity: 0, y: 6 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -4 }}
+      transition={{ type: "spring", stiffness: 280, damping: 28 }}
+      className="rounded-2xl border border-line-subtle bg-ink/[0.025] light:bg-surface-panel p-4 transition-colors hover:border-ink/20"
+    >
+      <CommentBody
+        comment={comment}
+        currentUserId={currentUserId}
+        isAdmin={isAdmin}
+        canWrite={canWrite}
+        onReply={onReply}
+        onDelete={onDelete}
+      />
+      {replies.length > 0 && (
+        <div className="relative mt-4 space-y-3 pl-5 sm:pl-7">
+          <div className="absolute left-1.5 top-0 bottom-2 w-px bg-gradient-to-b from-brand/30 via-ink/10 to-transparent" />
+          <AnimatePresence initial={false}>
+            {replies.map((r) => (
+              <motion.div
+                key={r.id}
+                layout
+                initial={{ opacity: 0, x: -8 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: -8 }}
+                className="relative"
+              >
+                <span className="absolute -left-3.5 top-4 h-px w-3 bg-ink/15" />
+                <CommentBody
+                  comment={r}
+                  currentUserId={currentUserId}
+                  isAdmin={isAdmin}
+                  canWrite={canWrite}
+                  onReply={onReply}
+                  onDelete={onDelete}
+                  isReply
+                />
+              </motion.div>
+            ))}
+          </AnimatePresence>
+        </div>
+      )}
+    </motion.div>
+  );
+}
+
+interface CommentBodyProps {
+  comment: CommunityComment;
+  currentUserId: string;
+  isAdmin: boolean;
+  canWrite: boolean;
+  onReply: (c: CommunityComment) => void;
+  onDelete: (id: string) => void;
+  isReply?: boolean;
+}
+
+function CommentBody({ comment, currentUserId, isAdmin, canWrite, onReply, onDelete, isReply }: CommentBodyProps) {
+  const canDelete = isAdmin || comment.author_id === currentUserId;
+  const authorIsAdmin = comment.author?.role === "admin";
+
+  return (
+    <div className="group/comment flex items-start gap-3">
+      <AuthorAvatar author={comment.author} size={isReply ? "sm" : "md"} />
+      <div className="min-w-0 flex-1">
+        <div className="mb-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs">
+          <span className="font-semibold text-foreground-strong">{authorName(comment.author)}</span>
+          {authorIsAdmin && (
+            <span className="rounded-full bg-brand/15 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-accent ring-1 ring-focus/30">
+              Admin
+            </span>
+          )}
+          <span className="text-foreground-muted">· {formatRelative(comment.created_at)}</span>
+        </div>
+        <p className="whitespace-pre-wrap text-[14px] leading-relaxed text-foreground">{comment.body}</p>
+        <div className="mt-2 flex items-center gap-1">
+          <LikeButton
+            targetType="comment"
+            targetId={comment.id}
+            liked={comment.liked_by_me ?? false}
+            count={comment.like_count}
+            size="sm"
+            readOnly={!canWrite}
+          />
+          {!isReply && canWrite && (
+            <button
+              type="button"
+              onClick={() => onReply(comment)}
+              className="inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium text-foreground-muted transition-colors hover:bg-ink/10 hover:text-foreground-strong"
+            >
+              <CornerDownRight size={12} /> Responder
+            </button>
+          )}
+          {canDelete && (
+            // Visible sin hover: en celular y con teclado no había forma de
+            // llegar. Atenuado hasta que se pasa por encima o se enfoca.
+            <button
+              type="button"
+              onClick={() => onDelete(comment.id)}
+              className="ml-auto inline-flex size-9 items-center justify-center rounded-full text-xs text-danger opacity-60 transition-all hover:bg-red-500/10 hover:text-red-300 hover:opacity-100 focus-visible:opacity-100 light:hover:text-danger group-hover/comment:opacity-100"
+              aria-label={`Eliminar comentario de ${authorName(comment.author)}`}
+            >
+              <Trash2 size={14} aria-hidden />
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}

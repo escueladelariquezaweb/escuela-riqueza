@@ -1,0 +1,551 @@
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { motion, AnimatePresence } from "motion/react";
+import { AlertTriangle, Flame, Loader2, Lock, MessageSquare, Pin, Plus, RotateCw, Sparkles, Clock, Users } from "lucide-react";
+import { supabase } from "@/lib/supabase";
+import { toast } from "@/components/ui/toaster";
+import { cn } from "@/lib/utils";
+import { scrollToElement, scrollToY } from "@/lib/smoothScroll";
+import {
+  deletePost,
+  fetchPosts,
+  type CommunityCategory,
+  type CommunityPost,
+  type CommunitySort,
+} from "@/lib/api/community";
+import { CATEGORIES } from "./community-utils";
+import { PostCard } from "./PostCard";
+import { NewPostDialog } from "./NewPostDialog";
+import { PostDetail } from "./PostDetail";
+import { ConfirmDialog } from "./ConfirmDialog";
+
+/** Tope de `fetchPosts`: las métricas cuentan solo lo cargado. */
+const POSTS_LIMIT = 100;
+
+interface CommunityFeedProps {
+  currentUserId: string;
+  isAdmin: boolean;
+  canWrite: boolean;
+}
+
+export function CommunityFeed({ currentUserId, isAdmin, canWrite }: CommunityFeedProps) {
+  const navigate = useNavigate();
+  const [posts, setPosts] = useState<CommunityPost[]>([]);
+  // "loading" = primera carga (o cambio de filtro) sin nada que mostrar; un
+  // refresco con lista a la vista NO vuelve al skeleton (antes cada INSERT de
+  // realtime y cada vuelta del detalle hacían parpadear el feed entero).
+  const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
+  const [refreshing, setRefreshing] = useState(false);
+  const [sort, setSort] = useState<CommunitySort>("recent");
+  const [category, setCategory] = useState<CommunityCategory | null>(null);
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [selectedPostId, setSelectedPostId] = useState<string | null>(null);
+  // Dónde arranca el detalle: arriba de la publicación o en sus comentarios.
+  const [openSection, setOpenSection] = useState<"top" | "comments">("top");
+  // Contenedor común de feed y detalle: destino del scroll al abrir.
+  const rootRef = useRef<HTMLDivElement>(null);
+  const [pendingDelete, setPendingDelete] = useState<CommunityPost | null>(null);
+  // Solo la respuesta del pedido más reciente se aplica: con filtros rápidos,
+  // una respuesta vieja llegaba tarde y pisaba la vista nueva.
+  const requestIdRef = useRef(0);
+  // Posición de lectura al abrir una publicación, para volver al mismo lugar.
+  const savedScrollRef = useRef<number | null>(null);
+
+  const load = async ({ silent = false }: { silent?: boolean } = {}) => {
+    const requestId = ++requestIdRef.current;
+    if (silent) setRefreshing(true);
+    else setStatus("loading");
+    try {
+      const list = await fetchPosts(sort, category ?? undefined);
+      if (requestId !== requestIdRef.current) return;
+      setPosts(list);
+      setStatus("ready");
+    } catch {
+      if (requestId !== requestIdRef.current) return;
+      // Con lista a la vista se conserva y se avisa; sin lista, estado de error.
+      if (silent) toast.error("No pudimos actualizar la comunidad");
+      else setStatus("error");
+    } finally {
+      if (requestId === requestIdRef.current) setRefreshing(false);
+    }
+  };
+
+  useEffect(() => {
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sort, category]);
+
+  // Al abrir, el detalle reemplaza al feed pero el scroll quedaba donde
+  // estaba la tarjeta: con una publicación corta se caía al footer. Abrir
+  // desliza al inicio de la publicación (los comentarios los ubica el detalle
+  // cuando terminan de cargar). Volver restaura la posición de lectura de golpe:
+  // es el mismo lugar donde se estaba, no un viaje.
+  useLayoutEffect(() => {
+    if (selectedPostId !== null) {
+      // Con "comments" el corte al inicio es instantáneo (como cambiar de
+      // pantalla) y el único deslizamiento es hasta los comentarios cuando
+      // cargan; deslizar arriba y después abajo se veía como un yo-yo.
+      if (rootRef.current) scrollToElement(rootRef.current, { immediate: openSection === "comments" });
+      return;
+    }
+    if (savedScrollRef.current === null) return;
+    scrollToY(savedScrollRef.current, { immediate: true });
+    savedScrollRef.current = null;
+  }, [selectedPostId, openSection]);
+
+  const openPost = (id: string, section: "top" | "comments" = "top") => {
+    savedScrollRef.current = window.scrollY;
+    setOpenSection(section);
+    setSelectedPostId(id);
+  };
+
+  useEffect(() => {
+    const channel = supabase
+      .channel("community_posts_feed")
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "community_posts" },
+        () => {
+          load({ silent: true });
+        }
+      )
+      .on(
+        "postgres_changes",
+        { event: "DELETE", schema: "public", table: "community_posts" },
+        (payload) => {
+          const oldId = (payload.old as { id?: string }).id;
+          if (oldId) setPosts((prev) => prev.filter((p) => p.id !== oldId));
+        }
+      )
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "community_posts" },
+        (payload) => {
+          const updated = payload.new as Partial<CommunityPost>;
+          setPosts((prev) =>
+            prev.map((p) => {
+              if (p.id === updated.id) {
+                return {
+                  ...p,
+                  ...updated,
+                  author: p.author, // Preserve joined relation
+                  liked_by_me: p.liked_by_me, // Preserve user-specific state
+                };
+              }
+              return p;
+            })
+          );
+        }
+      )
+      .subscribe();
+    return () => {
+      supabase.removeChannel(channel);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sort, category]);
+
+  const stats = useMemo(() => {
+    const totalLikes = posts.reduce((a, p) => a + (p.like_count ?? 0), 0);
+    const totalComments = posts.reduce((a, p) => a + (p.comment_count ?? 0), 0);
+    const uniqueAuthors = new Set(posts.map((p) => p.author_id)).size;
+    return { totalPosts: posts.length, totalLikes, totalComments, uniqueAuthors };
+  }, [posts]);
+
+  const confirmDelete = async () => {
+    if (!pendingDelete) return;
+    try {
+      await deletePost(pendingDelete.id);
+      setPosts((prev) => prev.filter((p) => p.id !== pendingDelete.id));
+      toast.success("Publicación eliminada");
+    } catch (err) {
+      console.error(err);
+      toast.error("No se pudo eliminar");
+      throw err;
+    }
+  };
+
+  const loading = status === "loading";
+  const pinned = posts.filter((p) => p.is_pinned);
+  const regular = posts.filter((p) => !p.is_pinned);
+  const categoryLabel = category ? CATEGORIES.find((cat) => cat.id === category)?.label : null;
+
+  if (selectedPostId) {
+    return (
+      <div ref={rootRef}>
+      <PostDetail
+        postId={selectedPostId}
+        initialSection={openSection}
+        currentUserId={currentUserId}
+        isAdmin={isAdmin}
+        canWrite={canWrite}
+        onBack={() => {
+          setSelectedPostId(null);
+          load({ silent: true });
+        }}
+        onDeleted={() => {
+          setSelectedPostId(null);
+          load({ silent: true });
+        }}
+      />
+      </div>
+    );
+  }
+
+  return (
+    <div ref={rootRef} className="space-y-6">
+      {!canWrite && (
+        <motion.div
+          initial={{ opacity: 0, y: -8 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="flex flex-col items-start gap-3 rounded-2xl border border-brand/30 bg-brand/[0.08] p-5 sm:flex-row sm:items-center sm:justify-between"
+        >
+          <div className="flex items-start gap-3">
+            <span className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-brand/15 text-accent ring-1 ring-focus/30">
+              <Lock size={16} />
+            </span>
+            <div>
+              <h3 className="font-bold text-foreground-strong">Estás viendo la comunidad en modo lectura</h3>
+              <p className="mt-0.5 text-sm text-foreground-muted">
+                Con el plan Individual o VIP puedes publicar, comentar y reaccionar.
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => navigate("/planes")}
+            className="shrink-0 self-start rounded-xl bg-brand px-5 py-2.5 text-sm font-bold text-on-brand transition-colors hover:bg-brand-hover sm:self-auto"
+          >
+            Ver planes
+          </button>
+        </motion.div>
+      )}
+
+      {/* Hero header */}
+      <motion.div
+        initial={{ opacity: 0, y: -8 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="relative overflow-hidden rounded-3xl border border-line-subtle bg-gradient-to-br from-gold/[0.12] via-surface-page to-surface-page p-6 sm:p-8"
+      >
+        <div className="pointer-events-none absolute -top-24 -right-24 h-72 w-72 rounded-full bg-brand/20 blur-3xl" />
+        <div className="pointer-events-none absolute -bottom-32 -left-20 h-72 w-72 rounded-full bg-purple-500/8 blur-3xl" />
+        {/* Textura de puntos en el color del texto: blanca era invisible en claro. */}
+        <div className="pointer-events-none absolute inset-0 text-foreground-strong opacity-[0.04] [background-image:radial-gradient(circle_at_1px_1px,currentColor_1px,transparent_0)] [background-size:20px_20px]" />
+
+        <div className="relative flex flex-col gap-6 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <div className="mb-3 inline-flex items-center gap-2 rounded-full border border-brand/30 bg-brand/10 px-3 py-1 text-[11px] font-bold uppercase tracking-wider text-accent backdrop-blur-sm">
+              <Sparkles size={12} aria-hidden /> Espacio de miembros
+            </div>
+            <h2 className="text-3xl font-extrabold tracking-tight text-foreground-strong sm:text-4xl">
+              Comunidad{" "}
+              <span className="bg-gradient-to-r from-brand to-brand-hover light:from-gilt-start light:to-gilt-end bg-clip-text text-transparent">
+                VIP
+              </span>
+            </h2>
+            <p className="mt-2 max-w-xl text-sm text-foreground-muted sm:text-base">
+              Conecta con otros miembros, comparte preguntas, ideas y recursos.
+            </p>
+          </div>
+
+          {canWrite && (
+          <motion.button
+            type="button"
+            whileHover={{ scale: 1.03 }}
+            whileTap={{ scale: 0.97 }}
+            onClick={() => setDialogOpen(true)}
+            className="group relative inline-flex items-center justify-center gap-2 self-start overflow-hidden rounded-2xl bg-brand px-6 py-3 font-bold text-on-brand shadow-[0_8px_32px_-8px_rgba(204,164,59,0.6)] transition-all hover:bg-brand-hover sm:self-auto"
+          >
+            <span className="absolute inset-0 -translate-x-full bg-gradient-to-r from-transparent via-white/40 to-transparent transition-transform duration-700 group-hover:translate-x-full motion-reduce:hidden" />
+            <Plus size={18} aria-hidden /> Crear publicación
+          </motion.button>
+          )}
+        </div>
+
+        {/* Métricas de lo que se ve: cuentan las publicaciones cargadas con el
+            filtro actual (tope POSTS_LIMIT). "Miembros activos" sugería
+            gente conectada o el total de miembros; son autores de esta vista. */}
+        <div className="relative mt-6">
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 sm:gap-3">
+            <StatPill icon={MessageSquare} label="Publicaciones" value={loading ? null : stats.totalPosts} capped={posts.length >= POSTS_LIMIT} />
+            <StatPill icon={Flame} label="Me gusta" value={loading ? null : stats.totalLikes} />
+            <StatPill icon={MessageSquare} label="Comentarios" value={loading ? null : stats.totalComments} />
+            <StatPill icon={Users} label="Autores en esta vista" value={loading ? null : stats.uniqueAuthors} />
+          </div>
+          <p className="mt-2 text-[11px] text-foreground-muted">
+            {categoryLabel ? `En «${categoryLabel}»` : "En todas las categorías"}
+            {posts.length >= POSTS_LIMIT && ` · últimas ${POSTS_LIMIT} publicaciones`}
+          </p>
+        </div>
+      </motion.div>
+
+      {/* Filters bar */}
+      <div className="sticky top-2 z-10 flex flex-col gap-3 rounded-2xl border border-line-subtle bg-surface-page/80 p-3 backdrop-blur-xl sm:p-4">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-center gap-1.5 rounded-xl bg-ink/[0.04] light:bg-surface-subtle p-1 ring-1 ring-ink/5">
+            {([
+              { id: "recent", label: "Recientes", icon: Clock },
+              { id: "popular", label: "Populares", icon: Flame },
+            ] as const).map((opt) => {
+              const Icon = opt.icon;
+              const active = sort === opt.id;
+              return (
+                <button
+                  key={opt.id}
+                  type="button"
+                  aria-pressed={active}
+                  onClick={() => setSort(opt.id)}
+                  className={cn(
+                    "relative inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors",
+                    active ? "text-on-brand" : "text-foreground-muted hover:text-foreground-strong"
+                  )}
+                >
+                  {active && (
+                    <motion.span
+                      layoutId="sortPill"
+                      className="absolute inset-0 -z-10 rounded-lg bg-brand shadow-[0_0_16px_rgba(204,164,59,0.4)]"
+                      transition={{ type: "spring", stiffness: 400, damping: 32 }}
+                    />
+                  )}
+                  <Icon size={13} /> {opt.label}
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="hidden items-center gap-2 text-xs text-foreground-muted sm:flex" aria-live="polite">
+            {refreshing && <Loader2 size={12} className="animate-spin" aria-hidden />}
+            {refreshing ? "Actualizando…" : `${posts.length} ${posts.length === 1 ? "publicación" : "publicaciones"}`}
+          </div>
+        </div>
+
+        <div className="-mx-1 flex items-center gap-2 overflow-x-auto px-1 pb-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+          <CategoryChip active={category === null} onClick={() => setCategory(null)} label="Todas" />
+          {CATEGORIES.map((c) => {
+            const Icon = c.icon;
+            return (
+              <CategoryChip
+                key={c.id}
+                active={category === c.id}
+                onClick={() => setCategory(c.id)}
+                label={c.label}
+                icon={<Icon size={12} />}
+              />
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Feed */}
+      {loading ? (
+        <div className="space-y-3" aria-busy="true" aria-label="Cargando publicaciones">
+          {[0, 1, 2].map((i) => (
+            <SkeletonCard key={i} delay={i * 0.08} />
+          ))}
+        </div>
+      ) : status === "error" ? (
+        <div role="alert" className="rounded-3xl border border-red-500/25 bg-red-500/[0.06] px-6 py-12 text-center">
+          <AlertTriangle className="mx-auto mb-3 text-red-400 light:text-danger" size={28} aria-hidden />
+          <h3 className="mb-1 text-lg font-bold text-foreground-strong">No pudimos cargar la comunidad</h3>
+          <p className="mx-auto mb-5 max-w-sm text-sm text-foreground-muted">Revisa tu conexión. Tus filtros se mantienen.</p>
+          <button
+            type="button"
+            onClick={() => load()}
+            className="inline-flex min-h-11 items-center gap-2 rounded-xl bg-brand px-5 font-bold text-on-brand transition-colors hover:bg-brand-hover"
+          >
+            <RotateCw size={16} aria-hidden /> Reintentar
+          </button>
+        </div>
+      ) : posts.length === 0 && category ? (
+        // Vacío por filtro: no es "nadie publicó nunca".
+        <div className="rounded-3xl border border-dashed border-ink/15 px-6 py-12 text-center light:bg-surface-panel">
+          <h3 className="mb-1 text-lg font-bold text-foreground-strong">Sin publicaciones en «{categoryLabel}»</h3>
+          <p className="mx-auto mb-5 max-w-sm text-sm text-foreground-muted">Prueba con otra categoría o mira todo lo publicado.</p>
+          <button
+            type="button"
+            onClick={() => setCategory(null)}
+            className="inline-flex min-h-11 items-center rounded-xl border border-line-subtle px-5 font-semibold text-foreground-strong transition-colors hover:border-brand/40 hover:text-accent"
+          >
+            Ver todas
+          </button>
+        </div>
+      ) : posts.length === 0 ? (
+        <motion.div
+          initial={{ opacity: 0, scale: 0.97 }}
+          animate={{ opacity: 1, scale: 1 }}
+          className="relative overflow-hidden rounded-3xl border border-dashed border-ink/15 bg-gradient-to-br from-white/[0.03] to-transparent light:from-surface-panel py-16 text-center"
+        >
+          <div className="pointer-events-none absolute inset-x-0 -top-10 mx-auto h-40 w-40 rounded-full bg-brand/10 blur-3xl" />
+          <motion.div
+            animate={{ y: [0, -6, 0] }}
+            transition={{ duration: 3, repeat: Infinity, ease: "easeInOut" }}
+            className="mx-auto mb-4 inline-flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-brand/20 to-brand/5 ring-1 ring-focus/30"
+          >
+            <MessageSquare className="text-accent" size={28} />
+          </motion.div>
+          <h3 className="mb-2 text-xl font-bold text-foreground-strong">Aún no hay publicaciones</h3>
+          <p className="mx-auto mb-6 max-w-sm text-sm text-foreground-muted">
+            Sé el primero en iniciar una conversación. Pregunta, comparte una idea o un recurso valioso.
+          </p>
+          {canWrite && (
+            <button
+              type="button"
+              onClick={() => setDialogOpen(true)}
+              className="inline-flex items-center gap-2 rounded-xl bg-brand px-5 py-2.5 font-bold text-on-brand transition-colors hover:bg-brand-hover"
+            >
+              <Plus size={16} aria-hidden /> Crear la primera
+            </button>
+          )}
+        </motion.div>
+      ) : (
+        <motion.div layout className="space-y-3">
+          {/* Hijos directos con key, sin fragmento en medio: AnimatePresence
+              sigue cada hijo por su key para animar entradas y salidas. */}
+          <AnimatePresence mode="popLayout" initial={false}>
+                  {pinned.length > 0 && (
+                    <motion.div
+                      key="pinned-header"
+                      layout
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      exit={{ opacity: 0 }}
+                      className="flex items-center gap-2 pt-1 text-[11px] font-bold uppercase tracking-wider text-accent/90"
+                    >
+                      <Pin size={12} /> Fijado por el equipo
+                      <div className="h-px flex-1 bg-gradient-to-r from-brand/40 to-transparent" />
+                    </motion.div>
+                  )}
+                  {pinned.map((post) => (
+                    <PostCard
+                      key={post.id}
+                      post={post}
+                      canDelete={isAdmin || post.author_id === currentUserId}
+                      isAdmin={isAdmin}
+                      canWrite={canWrite}
+                      onOpen={() => openPost(post.id)}
+                      onOpenComments={() => openPost(post.id, "comments")}
+                      onDelete={() => setPendingDelete(post)}
+                      onPinChanged={(updated) =>
+                        setPosts((prev) => prev.map((p) => (p.id === updated.id ? { ...p, is_pinned: updated.is_pinned } : p)))
+                      }
+                    />
+                  ))}
+                  {pinned.length > 0 && regular.length > 0 && (
+                    <motion.div
+                      key="recent-header"
+                      layout
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      exit={{ opacity: 0 }}
+                      className="flex items-center gap-2 pt-3 text-[11px] font-bold uppercase tracking-wider text-foreground-muted"
+                    >
+                      <Clock size={12} /> Recientes
+                      <div className="h-px flex-1 bg-gradient-to-r from-white/15 to-transparent light:from-line-subtle" />
+                    </motion.div>
+                  )}
+                  {regular.map((post) => (
+                    <PostCard
+                      key={post.id}
+                      post={post}
+                      canDelete={isAdmin || post.author_id === currentUserId}
+                      isAdmin={isAdmin}
+                      canWrite={canWrite}
+                      onOpen={() => openPost(post.id)}
+                      onOpenComments={() => openPost(post.id, "comments")}
+                      onDelete={() => setPendingDelete(post)}
+                      onPinChanged={(updated) =>
+                        setPosts((prev) => prev.map((p) => (p.id === updated.id ? { ...p, is_pinned: updated.is_pinned } : p)))
+                      }
+                    />
+                  ))}
+          </AnimatePresence>
+        </motion.div>
+      )}
+
+      <NewPostDialog
+        open={dialogOpen && canWrite}
+        onOpenChange={setDialogOpen}
+        isAdmin={isAdmin}
+        onCreated={(post) => {
+          setPosts((prev) => (prev.some((p) => p.id === post.id) ? prev : [post, ...prev]));
+          openPost(post.id);
+        }}
+      />
+
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        onOpenChange={(open) => { if (!open) setPendingDelete(null); }}
+        title="¿Eliminar esta publicación?"
+        description="Se eliminarán también sus comentarios. No se puede deshacer."
+        confirmLabel="Eliminar"
+        onConfirm={confirmDelete}
+      />
+    </div>
+  );
+}
+
+function StatPill({ icon: Icon, label, value, capped = false }: { icon: React.ElementType; label: string; value: number | null; capped?: boolean }) {
+  return (
+    <div className="flex items-center gap-3 rounded-xl border border-line-subtle bg-ink/[0.03] light:bg-surface-panel px-3 py-2.5 backdrop-blur-sm">
+      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-brand/10 text-accent ring-1 ring-focus/20">
+        <Icon size={15} aria-hidden />
+      </div>
+      <div className="min-w-0">
+        {/* Cargando: guion, no un 0 que diga "no hay nada". */}
+        <div className="text-base font-bold tabular-nums text-foreground-strong leading-none">
+          {value === null ? "—" : capped ? `${value}+` : value}
+        </div>
+        <div className="mt-0.5 truncate text-[10px] uppercase tracking-wide text-foreground-muted">{label}</div>
+      </div>
+    </div>
+  );
+}
+
+function CategoryChip({
+  active,
+  onClick,
+  label,
+  icon,
+}: {
+  active: boolean;
+  onClick: () => void;
+  label: string;
+  icon?: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      className={cn(
+        "inline-flex shrink-0 items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-semibold transition-all",
+        active
+          ? "border-accent bg-brand text-on-brand shadow-[0_0_14px_rgba(204,164,59,0.35)]"
+          : "border-line-subtle bg-ink/[0.03] light:bg-surface-panel text-foreground-muted hover:border-ink/25 hover:text-foreground-strong"
+      )}
+    >
+      {icon}
+      {label}
+    </button>
+  );
+}
+
+function SkeletonCard({ delay = 0 }: { delay?: number }) {
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      transition={{ delay }}
+      className="rounded-2xl border border-line-subtle bg-ink/[0.02] light:bg-surface-panel p-5"
+    >
+      <div className="flex items-start gap-4">
+        <div className="h-11 w-11 shrink-0 animate-pulse rounded-full bg-ink/10" />
+        <div className="flex-1 space-y-3">
+          <div className="h-3 w-1/3 animate-pulse rounded bg-ink/10" />
+          <div className="h-5 w-3/4 animate-pulse rounded bg-ink/15" />
+          <div className="h-3 w-full animate-pulse rounded bg-ink/10" />
+          <div className="h-3 w-5/6 animate-pulse rounded bg-ink/10" />
+        </div>
+      </div>
+    </motion.div>
+  );
+}

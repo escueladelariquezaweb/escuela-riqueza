@@ -1,0 +1,158 @@
+import type { ReactNode } from "react";
+import { useRef } from "react";
+import { motion, useTransform } from "motion/react";
+import { Brain, Dumbbell, Sparkles } from "lucide-react";
+import EditableField from "@/components/feature/EditableField";
+import { useParallax } from "@/hooks/useParallax";
+
+interface Milestone {
+  id: number;
+  number: string;
+  titleKey: string;
+  descriptionKey: string;
+  defaultTitle: string;
+  defaultDescription: string;
+  icon: ReactNode;
+}
+
+const milestones: Milestone[] = [
+  {
+    id: 1,
+    number: "01",
+    titleKey: "path_step_1_title",
+    descriptionKey: "path_step_1_desc",
+    defaultTitle: "Aprende",
+    defaultDescription:
+      "Asimila los marcos mentales en clases pre-grabadas de alto valor. Cada lección entrega un concepto claro y aplicable desde el día uno.",
+    icon: <Brain className="w-7 h-7" />,
+  },
+  {
+    id: 2,
+    number: "02",
+    titleKey: "path_step_2_title",
+    descriptionKey: "path_step_2_desc",
+    defaultTitle: "Practica",
+    defaultDescription:
+      "Aplica lo aprendido con ejercicios y desafíos semanales. La comunidad y los lives VIP te acompañan en la construcción de hábitos sólidos.",
+    icon: <Dumbbell className="w-7 h-7" />,
+  },
+  {
+    id: 3,
+    number: "03",
+    titleKey: "path_step_3_title",
+    descriptionKey: "path_step_3_desc",
+    defaultTitle: "Transforma",
+    defaultDescription:
+      "Resultados medibles en tu economía, decisiones y propósito. Esto no es teoría motivacional — es rediseño real, sostenido en el tiempo.",
+    icon: <Sparkles className="w-7 h-7" />,
+  },
+];
+
+interface MilestoneRowProps {
+  milestone: Milestone;
+  index: number;
+}
+
+const MilestoneRow = ({ milestone, index }: MilestoneRowProps) => {
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 40 }}
+      whileInView={{ opacity: 1, y: 0 }}
+      viewport={{ once: true, margin: "-120px" }}
+      transition={{ duration: 0.7, delay: index * 0.08, ease: "easeOut" }}
+      className="relative pl-20 md:pl-28"
+    >
+      <div className="absolute left-6 md:left-10 top-1 -translate-x-1/2 w-12 h-12 md:w-14 md:h-14 rounded-full bg-surface-page border-2 border-accent flex items-center justify-center text-accent shadow-[0_0_20px_rgba(204,164,59,0.45)] light:bg-surface-panel light:shadow-[0_0_0_6px_rgba(204,164,59,0.14),0_10px_24px_-10px_rgba(60,45,15,0.3)] z-10">
+        {milestone.icon}
+      </div>
+
+      <span className="block text-xs md:text-sm uppercase tracking-[0.2em] text-accent font-bold mb-2">
+        Paso {milestone.number}
+      </span>
+      <h3 className="text-3xl md:text-4xl lg:text-5xl font-extrabold tracking-tight text-foreground-strong mb-4 leading-tight">
+        <EditableField textKey={milestone.titleKey} defaultValue={milestone.defaultTitle} as="span" />
+      </h3>
+      <p className="text-foreground-muted leading-relaxed text-base md:text-lg max-w-xl text-pretty">
+        <EditableField textKey={milestone.descriptionKey} defaultValue={milestone.defaultDescription} as="span" multiline />
+      </p>
+    </motion.div>
+  );
+};
+
+/**
+ * Acto 4 — El Camino.
+ *
+ * Timeline vertical con línea de progreso scroll-driven (no sticky).
+ * La línea se llena de gold conforme la sección pasa por el viewport.
+ * Cada hito (3) se revela al entrar al viewport con stagger.
+ *
+ * Responsive: mismo layout en todos los breakpoints (línea izquierda + texto derecha).
+ */
+export const PathAct = () => {
+  const sectionRef = useRef<HTMLDivElement>(null);
+
+  // Reveal de la línea: no es parallax decorativo sino un "fill" ligado al
+  // progreso. Por eso usamos `progress` (suavizado en móvil) y `reduce` para
+  // mostrarla completa de una si el usuario pidió menos movimiento.
+  const { progress, reduce } = useParallax({
+    target: sectionRef,
+    offset: ["start end", "end center"],
+  });
+
+  // scaleY en vez de height: height es propiedad de layout (no compone en GPU y
+  // tironea, sobre todo en móvil); scaleY va por el compositor.
+  const lineScale = useTransform(progress, [0.1, 0.95], [reduce ? 1 : 0, 1]);
+  const lineOpacity = useTransform(progress, [0, 0.05], [reduce ? 1 : 0, 1]);
+
+  return (
+    <section
+      ref={sectionRef}
+      id="camino"
+      className="relative max-w-4xl mx-auto px-6 py-24 md:py-32"
+      aria-label="El camino"
+    >
+      <div className="mb-16 md:mb-24 max-w-2xl">
+        <motion.h2
+          initial={{ opacity: 0, y: 20 }}
+          whileInView={{ opacity: 1, y: 0 }}
+          viewport={{ once: true, margin: "-100px" }}
+          transition={{ duration: 0.7 }}
+          className="text-4xl md:text-5xl lg:text-6xl font-extrabold tracking-tighter text-foreground-strong leading-tight mb-4 text-balance"
+        >
+          <EditableField textKey="path_title" defaultValue="Tu camino en" as="span" />{" "}
+          <span className="text-transparent bg-clip-text bg-gradient-to-r from-gilt-start via-gilt-mid to-gilt-end italic pr-5 box-decoration-clone">
+            <EditableField textKey="path_accent" defaultValue="tres pasos" as="span" className="inline" />
+          </span>
+          .
+        </motion.h2>
+        <motion.p
+          initial={{ opacity: 0, y: 20 }}
+          whileInView={{ opacity: 1, y: 0 }}
+          viewport={{ once: true, margin: "-100px" }}
+          transition={{ duration: 0.7, delay: 0.15 }}
+          className="text-foreground-muted text-lg md:text-xl"
+        >
+          <EditableField textKey="path_subtitle" defaultValue="Aprender, practicar, transformar. Sin atajos, sin promesas vacías." as="span" />
+        </motion.p>
+      </div>
+
+      <div className="relative">
+        <div
+          aria-hidden
+          className="absolute left-6 md:left-10 top-0 bottom-0 w-0.5 bg-ink/8 light:bg-line-subtle"
+        />
+        <motion.div
+          aria-hidden
+          style={{ scaleY: lineScale, opacity: lineOpacity }}
+          className="absolute left-6 md:left-10 top-0 bottom-0 w-0.5 bg-gradient-to-b from-brand via-brand-hover to-brand light:from-accent light:via-brand light:to-accent origin-top will-change-transform"
+        />
+
+        <div className="flex flex-col gap-20 md:gap-28">
+          {milestones.map((milestone, index) => (
+            <MilestoneRow key={milestone.id} milestone={milestone} index={index} />
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+};

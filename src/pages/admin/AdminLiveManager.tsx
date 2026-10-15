@@ -1,0 +1,1405 @@
+import { useState, useEffect } from "react";
+import { Radio, Image as ImageIcon, Settings2, Save, Plus, Trash2, PlayCircle, Calendar, Clock, Monitor, Copy, Upload, Download, Video, Info, Archive, Pencil, Check, X, Link2 } from "lucide-react";
+import { cn } from "@/lib/utils";
+import { fetchLives, fetchEndedLives, fetchRecording, createLive, updateLive, deleteLive, setActiveLive as apiSetActiveLive, deactivateAllLives, checkLiveInputStatus, archiveRecording, fetchRecordingUrl, setLivePublic, setLiveReplayPublic, buildPublicLiveUrl, type LiveEvent, type StreamRecording } from "@/lib/api/stream/lives";
+import { supabase } from "@/lib/supabase";
+import { authedFetch } from "@/lib/api/client";
+import { toast } from "@/components/ui/toaster";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import RecordingPlayer from "@/components/feature/RecordingPlayer";
+import { AdminBroadcastPanel } from "@/components/feature/admin-live/AdminBroadcastPanel";
+
+const CF_SUBDOMAIN = import.meta.env.VITE_CLOUDFLARE_STREAM_CUSTOMER_SUBDOMAIN || "";
+const PRESET_INPUT_IDS = [
+  { label: "Principal (950f6b7...)", value: "950f6b77844e5a369bbeea208b2c428e" },
+];
+
+const userTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+const tzAbbr = new Intl.DateTimeFormat("es", { timeZoneName: "short" })
+  .formatToParts(new Date())
+  .find(p => p.type === "timeZoneName")?.value || "";
+
+function isoToLocalDatetime(iso: string | null | undefined): string {
+  if (!iso) return "";
+  return new Date(iso).toLocaleString("sv-SE").replace(" ", "T").slice(0, 16);
+}
+
+/**
+ * La grabación ya pasó por el archivador y Stream no pudo convertirla a MP4 (supera
+ * la duración máxima). Queda en Stream, reproducible, y no tiene sentido reintentar.
+ * Es la marca que deja el Worker: `archived_at` cargado con `recording_storage` en 'stream'.
+ */
+/**
+ * Copia y confirma SOLO si el portapapeles aceptó (F30). `writeText` es una
+ * promesa que puede rechazarse (sin permiso, contexto no seguro) y antes se
+ * mostraba "copiado" igual.
+ */
+async function copyText(text: string, label: string): Promise<void> {
+  try {
+    if (!navigator.clipboard) throw new Error("Portapapeles no disponible");
+    await navigator.clipboard.writeText(text);
+    toast.success(`${label} copiado`);
+  } catch (err) {
+    console.error("[AdminLiveManager] no se pudo copiar:", err);
+    toast.error(`No se pudo copiar (${label}). Selecciona el texto y cópialo a mano.`);
+  }
+}
+
+function isKeptInStream(live: LiveEvent): boolean {
+  return live.recording_storage === "stream" && !!live.archived_at && !!live.recording_stream_uid;
+}
+
+function highestPlan(plans: string[]): "free" | "individual" | "vip" {
+  if (plans.includes("vip")) return "vip";
+  if (plans.includes("individual")) return "individual";
+  return "free";
+}
+
+/**
+ * Link público — cualquiera con la URL ve el en vivo sin registrarse. Se usa
+ * tanto en la pestaña de salas activas como en "Finalizados": una repetición
+ * también puede compartirse por link público (con el paywall de plan pago
+ * aplicando del lado del visitante), así que el admin necesita poder
+ * activar/copiar el link ahí también, no solo mientras la sala está en vivo.
+ */
+function PublicLinkControl({
+  live,
+  togglingPublicId,
+  setTogglingPublicId,
+  onUpdated,
+}: {
+  live: LiveEvent;
+  togglingPublicId: string | null;
+  setTogglingPublicId: (id: string | null) => void;
+  onUpdated: (updated: LiveEvent) => void;
+}) {
+  const [togglingReplay, setTogglingReplay] = useState(false);
+
+  return (
+    <div className="flex flex-col gap-2 pt-3 border-t border-ink/5">
+      <div className="flex items-center justify-between gap-3">
+        <span className="text-xs font-bold text-fg-70 flex items-center gap-1.5">
+          <Link2 size={13} className="text-accent" /> Link público
+        </span>
+        <button
+          onClick={async e => {
+            e.stopPropagation();
+            setTogglingPublicId(live.id);
+            try {
+              const updated = await setLivePublic(live.id, !live.is_public, live.share_token);
+              onUpdated(updated);
+              toast.success(updated.is_public ? "Link público activado" : "Link público desactivado");
+            } catch {
+              toast.error("Error al actualizar el link público");
+            } finally {
+              setTogglingPublicId(null);
+            }
+          }}
+          disabled={togglingPublicId === live.id}
+          className={cn(
+            "flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-bold transition-all border disabled:opacity-50",
+            live.is_public
+              ? "bg-brand/15 text-accent border-brand/30"
+              : "bg-ink/5 text-fg-40 border-line-subtle hover:border-ink/30 hover:text-fg-70"
+          )}
+        >
+          <span className={cn("w-2 h-2 rounded-full", live.is_public ? "bg-brand shadow-[0_0_6px_rgba(204,164,59,0.6)]" : "bg-ink/20")} />
+          {live.is_public ? "Público" : "Privado"}
+        </button>
+      </div>
+      {live.is_public && live.share_token && (
+        <div className="space-y-1.5">
+          <div className="flex items-center gap-2">
+            <input
+              readOnly
+              value={buildPublicLiveUrl(live.share_token)}
+              onClick={e => (e.target as HTMLInputElement).select()}
+              className="flex-1 min-w-0 bg-black/40 border border-line-subtle text-fg-80 rounded-lg px-3 py-1.5 text-xs font-mono truncate light:bg-surface-panel"
+            />
+            <button
+              onClick={e => {
+                e.stopPropagation();
+                void copyText(buildPublicLiveUrl(live.share_token!), "Link");
+              }}
+              className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold bg-brand/15 text-accent border border-brand/30 hover:bg-brand/25 transition-colors"
+            >
+              <Copy size={13} /> Copiar
+            </button>
+          </div>
+          <p className="text-[10px] text-yellow-500/80 light:text-warning leading-relaxed">
+            Cualquier persona con este link puede ver el en vivo sin registrarse. También permite ver la grabación cuando el en vivo termine.
+          </p>
+
+          <div className="flex items-center justify-between gap-3 pt-2 mt-1 border-t border-ink/5">
+            <span className="text-xs font-bold text-fg-70 flex items-center gap-1.5">
+              <Video size={13} className="text-accent" /> Repetición abierta a todos
+            </span>
+            <button
+              onClick={async e => {
+                e.stopPropagation();
+                setTogglingReplay(true);
+                try {
+                  const updated = await setLiveReplayPublic(live.id, !live.replay_is_public);
+                  onUpdated(updated);
+                  toast.success(updated.replay_is_public ? "Repetición abierta a todos" : "Repetición vuelve a ser solo para alumnos");
+                } catch {
+                  toast.error("Error al actualizar la repetición pública");
+                } finally {
+                  setTogglingReplay(false);
+                }
+              }}
+              disabled={togglingReplay}
+              className={cn(
+                "flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-bold transition-all border disabled:opacity-50",
+                live.replay_is_public
+                  ? "bg-brand/15 text-accent border-brand/30"
+                  : "bg-ink/5 text-fg-40 border-line-subtle hover:border-ink/30 hover:text-fg-70"
+              )}
+            >
+              <span className={cn("w-2 h-2 rounded-full", live.replay_is_public ? "bg-brand shadow-[0_0_6px_rgba(204,164,59,0.6)]" : "bg-ink/20")} />
+              {live.replay_is_public ? "Abierta" : "Solo alumnos"}
+            </button>
+          </div>
+          <p className="text-[10px] text-fg-50 leading-relaxed">
+            {live.replay_is_public
+              ? "Cualquier persona con el link podrá ver la repetición, sin cuenta ni plan."
+              : "Al terminar, solo los alumnos con plan Individual o VIP pueden ver la repetición."}
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const AdminLiveManager = () => {
+  const [activeTab, setActiveTab] = useState<"editor" | "rooms" | "ended">("editor");
+  const [lives, setLives] = useState<LiveEvent[]>([]);
+  const [endedLives, setEndedLives] = useState<LiveEvent[]>([]);
+  const [activeLive, setActiveLive] = useState<LiveEvent | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
+  const [customInputId, setCustomInputId] = useState(false);
+  const [obsConnected, setObsConnected] = useState(false);
+  // Sondeo de OBS apagado (DEV o errores repetidos): "sin señal" no sería un dato fiable.
+  const [obsUnavailable, setObsUnavailable] = useState(false);
+  const [archivingId, setArchivingId] = useState<string | null>(null);
+  const [linkingId, setLinkingId] = useState<string | null>(null);
+  // Selector de grabación: se abre cuando el Live Input tiene más de una transmisión.
+  const [recordingPicker, setRecordingPicker] = useState<{ live: LiveEvent; recordings: StreamRecording[] } | null>(null);
+  const [pickingUid, setPickingUid] = useState<string | null>(null);
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+  const [savingRename, setSavingRename] = useState(false);
+  const [togglingPublicId, setTogglingPublicId] = useState<string | null>(null);
+
+  const [formData, setFormData] = useState<Partial<LiveEvent>>({
+    title: "",
+    description: "",
+    stream_live_input_id: "",
+    recording_stream_uid: "",
+    starts_at: "",
+    background_image_url: "",
+    allowed_plans: ["vip"],
+    status: "scheduled",
+    required_plan: "vip",
+    duration_minutes: null,
+    is_active: false,
+    is_paused: false,
+  });
+
+  useEffect(() => { loadData(); }, []);
+
+  useEffect(() => {
+    if (!activeLive?.stream_live_input_id || activeLive.status === "ended") return;
+    let failCount = 0;
+    const check = async () => {
+      const { connected, isError, disabled } = await checkLiveInputStatus(activeLive.stream_live_input_id!);
+      if (disabled) { setObsUnavailable(true); clearInterval(poll); return; }
+      if (isError) {
+        failCount++;
+        if (failCount >= 3) { setObsUnavailable(true); clearInterval(poll); return; }
+      } else {
+        failCount = 0;
+        setObsUnavailable(false);
+      }
+      setObsConnected(prev => connected !== prev ? connected : prev);
+
+      if (connected && activeLive.status === "scheduled") {
+        try {
+          const updated = await updateLive(activeLive.id, { status: "live", is_paused: false });
+          setLives(prev => prev.map(l => l.id === updated.id ? updated : l));
+          setActiveLive(updated);
+          setFormData(prev => ({ ...prev, status: "live" }));
+          toast.success("Transmisión detectada. Sala ahora EN VIVO.");
+        } catch (err) {
+          console.error(err);
+        }
+      }
+    };
+    const poll = setInterval(check, 10000);
+    check();
+    return () => clearInterval(poll);
+  }, [activeLive?.id, activeLive?.stream_live_input_id, activeLive?.status]);
+
+  const uploadBackground = async (file: File) => {
+    if (file.size > 5 * 1024 * 1024) { toast.error("La imagen no puede superar 5MB"); return; }
+    const ext = file.name.split(".").pop() || "jpg";
+    const filePath = `lives/${Date.now()}.${ext}`;
+    try {
+      toast.info("Subiendo imagen...");
+      const { error: uploadError } = await supabase.storage
+        .from("backgrounds")
+        .upload(filePath, file, { upsert: true });
+      if (uploadError) throw uploadError;
+      const { data: { publicUrl } } = supabase.storage
+        .from("backgrounds")
+        .getPublicUrl(filePath);
+      setFormData(prev => ({ ...prev, background_image_url: publicUrl }));
+      toast.success("Imagen subida");
+    } catch (err) {
+      console.error(err);
+      toast.error("Error al subir la imagen. ¿Ejecutaste las policies de RLS del bucket 'backgrounds'?");
+    }
+  };
+
+  const loadData = async () => {
+    try {
+      setLoading(true);
+      const [active, ended] = await Promise.all([fetchLives(), fetchEndedLives()]);
+      setLives(active);
+      setEndedLives(ended);
+      // Seleccionar la sala activa (is_active=true), o la primera si ninguna está activa
+      const activeRoom = active.find(l => l.is_active) || active[0] || null;
+      if (activeRoom) {
+        setActiveLive(activeRoom);
+        setFormData(activeRoom);
+        setCustomInputId(!PRESET_INPUT_IDS.some(p => p.value === activeRoom.stream_live_input_id));
+      }
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const selectRoom = async (live: LiveEvent) => {
+    const { data, error } = await supabase
+      .from("lives")
+      .select("*")
+      .eq("id", live.id)
+      .single();
+    if (data && !error) {
+      const fresh = data as LiveEvent;
+      setActiveLive(fresh);
+      setFormData(fresh);
+      setCustomInputId(!PRESET_INPUT_IDS.some(p => p.value === fresh.stream_live_input_id));
+    } else {
+      setActiveLive(live);
+      setFormData(live);
+      setCustomInputId(!PRESET_INPUT_IDS.some(p => p.value === live.stream_live_input_id));
+    }
+    setActiveTab("editor");
+  };
+
+  const handleDownloadRecording = async (videoUid: string) => {
+    toast.loading("Verificando estado de la grabación...", { id: `dl-${videoUid}` });
+    try {
+      const res = await authedFetch("/api/stream/download-status", {
+        method: "POST",
+        body: JSON.stringify({ video_uid: videoUid })
+      });
+      
+      if (!res.ok) {
+        // Fallback local: Si la API de Vercel no está corriendo localmente (da 502),
+        // abrimos la pestaña directa — solo si tenemos el subdominio configurado.
+        toast.dismiss(`dl-${videoUid}`);
+        openDownloadFallback(videoUid);
+        return;
+      }
+
+      const data = await res.json();
+
+      if (data.status === "ready" && data.url) {
+        toast.dismiss(`dl-${videoUid}`);
+        window.open(data.url, "_blank");
+      } else if (data.status === "error") {
+        toast.error("Cloudflare no pudo generar el MP4", { description: "Vuelve a intentarlo en unos minutos.", id: `dl-${videoUid}`, duration: 5000 });
+      } else {
+        // 'inprogress' (o recién habilitada): Cloudflare está generando el MP4.
+        toast.loading(`Cloudflare está generando el MP4... ${Math.round(data.percentComplete)}%`, { id: `dl-${videoUid}`, duration: 6000 });
+      }
+    } catch (error) {
+      console.error("Error comprobando descarga", error);
+      toast.dismiss(`dl-${videoUid}`);
+      // Fallback en caso de error de red
+      openDownloadFallback(videoUid);
+    }
+  };
+
+  const openDownloadFallback = (videoUid: string) => {
+    if (!CF_SUBDOMAIN) {
+      toast.error("No se pudo abrir la descarga", { description: "Falta configurar VITE_CLOUDFLARE_STREAM_CUSTOMER_SUBDOMAIN." });
+      return;
+    }
+    window.open(`https://${CF_SUBDOMAIN}/${videoUid}/downloads/default.mp4`, "_blank");
+  };
+
+  // Descarga de una grabación ya archivada en R2 (URL firmada de vida corta).
+  const handleDownloadR2 = async (liveId: string) => {
+    toast.loading("Generando enlace de descarga...", { id: `dl-r2-${liveId}` });
+    const url = await fetchRecordingUrl(liveId);
+    toast.dismiss(`dl-r2-${liveId}`);
+    if (url) window.open(url, "_blank");
+    else toast.error("No se pudo generar el enlace de descarga");
+  };
+
+  // Archiva la grabación en R2 (copia desde Stream + borra de Stream) para ahorrar costos.
+  const handleArchive = async (live: LiveEvent) => {
+    if (!live.recording_stream_uid) {
+      toast.error("Primero vincula la grabación (Obtener grabación) antes de archivar");
+      return;
+    }
+    setArchivingId(live.id);
+    toast.loading("Archivando en R2...", { id: `arch-${live.id}` });
+    const result = await archiveRecording(live.id, live.recording_stream_uid);
+    setArchivingId(null);
+
+    if (result.status === "archived") {
+      toast.success("Grabación archivada en R2 y borrada de Stream", {
+        id: `arch-${live.id}`,
+        description: "Ya no genera costo recurrente en Cloudflare Stream.",
+      });
+      const ended = await fetchEndedLives();
+      setEndedLives(ended);
+    } else if (result.status === "processing") {
+      toast.info(`Cloudflare todavía está generando el MP4... ${Math.round(result.percent)}%`, {
+        id: `arch-${live.id}`,
+        description: "Vuelve a intentarlo en unos minutos.",
+        duration: 6000,
+      });
+    } else if (result.status === "unarchivable") {
+      toast.warning("Este vivo supera las 4 h", {
+        id: `arch-${live.id}`,
+        description: result.message,
+        duration: 10000,
+      });
+      const ended = await fetchEndedLives();
+      setEndedLives(ended);
+    } else {
+      toast.error(result.message, { id: `arch-${live.id}` });
+    }
+  };
+
+  // Red de seguridad: vincula la grabación de un evento ya finalizado con un solo
+  // clic, sin tener que reactivar, forzar en vivo ni pegar el UID a mano.
+  //
+  // Un Live Input guarda un video por CADA transmisión, así que una reconexión de OBS
+  // deja varias grabaciones. Cuando hay más de una, no se adivina: se abre el selector
+  // con la más larga sugerida arriba.
+  const handleLinkRecording = async (live: LiveEvent) => {
+    if (!live.stream_live_input_id) {
+      toast.error("Este evento no tiene un Live Input configurado");
+      return;
+    }
+    setLinkingId(live.id);
+    toast.loading("Buscando grabaciones en Cloudflare...", { id: `link-${live.id}` });
+    try {
+      const result = await fetchRecording(live.stream_live_input_id, { startsAt: live.starts_at });
+      if (!result.recording_uid) {
+        toast.error(result.message || "Cloudflare todavía no generó la grabación. Vuelve a intentarlo en unos minutos.", { id: `link-${live.id}` });
+        return;
+      }
+
+      const options = result.recordings ?? [];
+      if (options.length > 1) {
+        toast.dismiss(`link-${live.id}`);
+        setRecordingPicker({ live, recordings: options });
+        return;
+      }
+
+      await applyRecording(live, result.recording_uid);
+      toast.success("Grabación vinculada", { id: `link-${live.id}`, description: "Ya puedes verla y descargarla aquí." });
+    } catch (err) {
+      console.error(err);
+      toast.error("Error al vincular la grabación", { id: `link-${live.id}` });
+    } finally {
+      setLinkingId(null);
+    }
+  };
+
+  /**
+   * Guarda el UID elegido en la sala y refresca la lista de finalizados.
+   *
+   * Si la sala ya estaba archivada, hay que limpiar los campos de R2: el player
+   * prioriza R2 sobre Stream (`RecordingPlayer`: si hay `recording_r2_key` nunca mira
+   * `recording_stream_uid`), así que sin esto se seguiría viendo la grabación anterior.
+   * La sala vuelve a apuntar a Stream y queda lista para archivarse de nuevo.
+   */
+  const applyRecording = async (live: LiveEvent, recordingUid: string) => {
+    const updated = await updateLive(live.id, {
+      recording_stream_uid: recordingUid,
+      recording_r2_key: null,
+      recording_storage: "stream",
+      recording_bytes: null,
+      recording_duration_seconds: null,
+      archived_at: null,
+    });
+    setEndedLives(prev => prev.map(l => l.id === updated.id ? updated : l));
+    return updated;
+  };
+
+  /** El admin eligió una grabación puntual del selector. */
+  const handlePickRecording = async (recording: StreamRecording) => {
+    const picker = recordingPicker;
+    if (!picker) return;
+    setPickingUid(recording.uid);
+    toast.loading("Vinculando grabación...", { id: `pick-${picker.live.id}` });
+    try {
+      // Segunda llamada con el uid elegido: habilita la descarga MP4 de ESE video.
+      await fetchRecording(picker.live.stream_live_input_id!, { videoUid: recording.uid, startsAt: picker.live.starts_at });
+      await applyRecording(picker.live, recording.uid);
+      setRecordingPicker(null);
+      toast.success("Grabación vinculada", {
+        id: `pick-${picker.live.id}`,
+        description: "Archivala en R2 para dejar de pagar storage en Stream.",
+      });
+    } catch (err) {
+      console.error(err);
+      toast.error("Error al vincular la grabación", { id: `pick-${picker.live.id}` });
+    } finally {
+      setPickingUid(null);
+    }
+  };
+
+  // Renombrado inline de una grabación finalizada, sin tener que reactivar la sala
+  // ni pasar por el editor. Solo toca el campo `title`.
+  const startRename = (live: LiveEvent) => {
+    setRenamingId(live.id);
+    setRenameValue(live.title || "");
+  };
+
+  const cancelRename = () => {
+    setRenamingId(null);
+    setRenameValue("");
+  };
+
+  const handleRename = async (live: LiveEvent) => {
+    const title = renameValue.trim();
+    if (!title) {
+      toast.error("El nombre no puede quedar vacío");
+      return;
+    }
+    if (title === (live.title || "")) {
+      cancelRename();
+      return;
+    }
+    setSavingRename(true);
+    try {
+      const updated = await updateLive(live.id, { title });
+      setEndedLives(prev => prev.map(l => l.id === updated.id ? updated : l));
+      if (activeLive?.id === updated.id) {
+        setActiveLive(updated);
+        setFormData(prev => ({ ...prev, title: updated.title }));
+      }
+      cancelRename();
+      toast.success("Nombre actualizado");
+    } catch (err) {
+      console.error(err);
+      toast.error("Error al renombrar la grabación");
+    } finally {
+      setSavingRename(false);
+    }
+  };
+
+  const handleSave = async () => {
+    if (!activeLive) return;
+    const plans = formData.allowed_plans || ["vip"];
+    const payload = {
+      ...formData,
+      required_plan: highestPlan(plans),
+    };
+    try {
+      setIsSaving(true);
+      const updated = await updateLive(activeLive.id, payload);
+      setLives(prev => prev.map(l => l.id === updated.id ? updated : l));
+      setActiveLive(updated);
+      setFormData(updated);
+      toast.success("Sala guardada", { description: "Los cambios se aplicaron correctamente." });
+    } catch (err) {
+      console.error(err);
+      toast.error("Error al guardar");
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleToggleLive = async (goingLive: boolean) => {
+    if (!activeLive) return;
+    try {
+      setIsSaving(true);
+      if (goingLive) {
+        for (const live of lives) {
+          if (live.status === "live" && !live.is_paused && live.id !== activeLive.id) {
+            await updateLive(live.id, { status: "scheduled", is_paused: false });
+          }
+        }
+      }
+      const updated = await updateLive(activeLive.id, {
+        status: goingLive ? "live" : "scheduled",
+        is_paused: false,
+      });
+      setLives(prev => prev.map(l => l.id === updated.id ? updated : l).map(l => goingLive && l.id !== updated.id ? { ...l, status: "scheduled" as const, is_paused: false } : l));
+      setActiveLive(updated);
+      setFormData(prev => ({ ...prev, status: goingLive ? "live" : "scheduled", is_paused: false }));
+      if (goingLive) toast.success("Sala EN VIVO");
+      else toast.success("Sala Programada");
+    } catch (err) {
+      console.error(err);
+      toast.error("Error cambiando estado");
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  // Finalizar: disponible en vivo y en pausa (F29). Los alumnos pasan a ver
+  // "Transmisión finalizada" (F33); OBS no se corta desde acá.
+  const handleFinalize = async () => {
+    if (!activeLive) return;
+    if (!window.confirm(
+      "¿Finalizar la clase?\n\nLos alumnos verán «Transmisión finalizada» y la sala pasa a Finalizados. " +
+      "OBS sigue emitiendo hasta que lo detengas."
+    )) return;
+    try {
+      const recordingUid = activeLive.stream_live_input_id
+        ? (await fetchRecording(activeLive.stream_live_input_id, { startsAt: activeLive.starts_at })).recording_uid
+        : null;
+      const updated = await updateLive(activeLive.id, { status: "ended", recording_stream_uid: recordingUid || formData.recording_stream_uid });
+      setLives(prev => prev.map(l => l.id === updated.id ? updated : l).filter(l => l.status !== "ended"));
+      setActiveLive(null);
+      setFormData({ title: "", description: "", stream_live_input_id: PRESET_INPUT_IDS[0]?.value || "", recording_stream_uid: "", starts_at: "", background_image_url: "", allowed_plans: ["vip"], status: "scheduled", required_plan: "vip", duration_minutes: null, is_active: false });
+      const ended = await fetchEndedLives();
+      setEndedLives(ended);
+      setActiveTab("ended");
+      if (recordingUid) {
+        toast.success("Sala finalizada y grabación vinculada automáticamente");
+      } else {
+        toast.success("Sala finalizada. Usa 'Obtener grabación' en el editor si la grabación no se vinculó automáticamente.");
+      }
+    } catch (err) {
+      console.error(err);
+      toast.error("No se pudo finalizar la sala. Revisa la conexión e inténtalo de nuevo.");
+    }
+  };
+
+  const handlePauseResume = async (pause: boolean) => {
+    if (!activeLive) return;
+    try {
+      setIsSaving(true);
+      const updated = await updateLive(activeLive.id, { is_paused: pause });
+      setLives(prev => prev.map(l => l.id === updated.id ? updated : l));
+      setActiveLive(updated);
+      setFormData(prev => ({ ...prev, is_paused: pause }));
+      if (pause) toast.success("Transmisión Pausada");
+      else toast.success("Transmisión Reanudada");
+    } catch (err) {
+      console.error(err);
+      toast.error("Error al pausar/reanudar");
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleCreateNew = async () => {
+    try {
+      setIsSaving(true);
+      // Al crear nueva sala, usar el Input ID principal por defecto
+      const defaultInputId = PRESET_INPUT_IDS[0]?.value || "";
+      setCustomInputId(false);
+      const newLive = await createLive({
+        title: "Nuevo Evento",
+        description: "",
+        stream_live_input_id: defaultInputId,
+        recording_stream_uid: "",
+        starts_at: new Date(Date.now() + 86400000).toISOString(),
+        background_image_url: "",
+        allowed_plans: ["vip"],
+        status: "scheduled",
+        required_plan: "vip",
+        duration_minutes: null,
+      });
+      // Auto-activar la nueva sala (desactiva cualquier otra que estuviera activa)
+      const activated = await apiSetActiveLive(newLive.id);
+      setLives(prev => [activated, ...prev.filter(l => l.id !== activated.id).map(l => ({ ...l, is_active: false }))]);
+      setActiveLive(activated);
+      setFormData(activated);
+      setActiveTab("editor");
+      toast.success("Sala creada y activada", { description: "Ya está visible para los usuarios en /vip-live." });
+    } catch (err) {
+      console.error(err);
+      toast.error("Error al crear sala");
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleDelete = async (id: string) => {
+    if (!window.confirm("¿Eliminar esta sala permanentemente?")) return;
+    try {
+      await deleteLive(id);
+      const remaining = lives.filter(l => l.id !== id);
+      setLives(remaining);
+      // La sala puede estar en "Finalizados": sin esto seguía visible hasta recargar.
+      setEndedLives(prev => prev.filter(l => l.id !== id));
+      if (activeLive?.id === id) {
+        if (remaining.length > 0) {
+          setActiveLive(remaining[0]);
+          setFormData(remaining[0]);
+        } else {
+          setActiveLive(null);
+          setFormData({
+            title: "", description: "", stream_live_input_id: PRESET_INPUT_IDS[0]?.value || "", starts_at: "",
+            background_image_url: "", allowed_plans: ["vip"], status: "scheduled",
+            required_plan: "vip", duration_minutes: null, is_active: false, is_paused: false,
+          });
+          setCustomInputId(false);
+        }
+      }
+      toast.success("Sala eliminada");
+    } catch (err) {
+      console.error(err);
+      toast.error("No se pudo eliminar la sala");
+    }
+  };
+
+  const copyToClipboard = (text: string, label: string) => {
+    void copyText(text, label);
+  };
+
+  if (loading) return (
+    <div className="max-w-5xl mx-auto pb-20">
+      <div className="animate-pulse space-y-6">
+        <div className="flex justify-between items-start mb-8">
+          <div className="space-y-3">
+            <div className="h-8 w-64 bg-ink/10 rounded-lg" />
+            <div className="h-4 w-48 bg-ink/5 rounded-lg" />
+          </div>
+          <div className="h-10 w-28 bg-ink/10 rounded-xl" />
+        </div>
+        <div className="h-12 bg-ink/5 rounded-xl" />
+        <div className="h-64 bg-ink/5 rounded-2xl" />
+        <div className="h-48 bg-ink/5 rounded-2xl" />
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="max-w-5xl mx-auto pb-20">
+      <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-8 gap-4">
+        <div>
+          <h1 className="text-3xl font-extrabold text-foreground-strong tracking-tight flex items-center gap-3">
+            <Radio className="text-red-500 light:text-danger" /> Gestor de En Vivo
+          </h1>
+          <p className="text-foreground-muted mt-1">Crea, programa y controla tus transmisiones en vivo para usuarios VIP.</p>
+        </div>
+        <div className="flex gap-2 w-full md:w-auto">
+          <button onClick={handleCreateNew} disabled={isSaving}
+            className="flex-1 md:flex-none bg-ink/10 hover:bg-ink/20 text-foreground-strong px-3 sm:px-4 py-2.5 rounded-xl flex items-center justify-center gap-2 text-sm font-bold transition-colors">
+            <Plus size={18} /> <span className="whitespace-nowrap">Nueva Sala</span>
+          </button>
+          {activeLive && (
+            <button onClick={handleSave} disabled={isSaving}
+              className="flex-1 md:flex-none bg-brand hover:bg-brand-hover text-on-brand font-bold px-3 sm:px-5 py-2.5 rounded-xl flex items-center justify-center gap-2 transition-all disabled:opacity-50">
+              <Save size={18} /> <span className="whitespace-nowrap">{isSaving ? "Guardando..." : "Guardar"}</span>
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Tabs */}
+      <div className="flex gap-2 mb-6 border-b border-line-subtle pb-4 overflow-x-auto custom-scrollbar -mx-1 px-1">
+        <button onClick={() => setActiveTab("editor")}
+          className={cn("px-3 sm:px-4 py-2 rounded-lg font-semibold text-xs sm:text-sm transition-all whitespace-nowrap shrink-0 flex items-center gap-2", activeTab === "editor" ? "bg-ink/10 text-foreground-strong" : "text-foreground-muted hover:text-foreground-strong")}>
+          <Settings2 size={16} />Editor
+        </button>
+        <button onClick={() => setActiveTab("rooms")}
+          className={cn("px-3 sm:px-4 py-2 rounded-lg font-semibold text-xs sm:text-sm transition-all whitespace-nowrap shrink-0 flex items-center gap-2", activeTab === "rooms" ? "bg-ink/10 text-foreground-strong" : "text-foreground-muted hover:text-foreground-strong")}>
+          <Radio size={16} />Salas ({lives.length})
+        </button>
+        <button onClick={() => setActiveTab("ended")}
+          className={cn("px-3 sm:px-4 py-2 rounded-lg font-semibold text-xs sm:text-sm transition-all whitespace-nowrap shrink-0 flex items-center gap-2", activeTab === "ended" ? "bg-ink/10 text-foreground-strong" : "text-foreground-muted hover:text-foreground-strong")}>
+          <Video size={16} />Finalizados ({endedLives.length})
+        </button>
+      </div>
+
+      {activeTab === "editor" && activeLive && (
+        <div className="space-y-6">
+          <AdminBroadcastPanel
+            live={activeLive}
+            obsConnected={obsConnected}
+            obsUnavailable={obsUnavailable}
+            isSaving={isSaving}
+            onStart={() => handleToggleLive(true)}
+            onPause={() => handlePauseResume(true)}
+            onResume={() => handlePauseResume(false)}
+            onFinalize={handleFinalize}
+          />
+
+          {/* Información del Evento */}
+          <div className="bg-surface-page border border-line-subtle rounded-2xl p-6">
+            <h3 className="text-lg font-bold text-foreground-strong mb-4 flex items-center gap-2">
+              <Settings2 size={18} className="text-accent" /> Información del Evento
+            </h3>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+              <div className="space-y-2">
+                <label className="text-sm font-semibold text-foreground-muted">Título del evento</label>
+                <input type="text" value={formData.title || ""}
+                  onChange={e => setFormData({ ...formData, title: e.target.value })}
+                  className="w-full bg-black/50 border border-line-subtle rounded-xl px-4 py-3 text-foreground-strong focus:outline-none focus:border-accent light:bg-surface-input light:border-line-control/50 light:placeholder:text-foreground-placeholder" />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-semibold text-foreground-muted flex items-center gap-2">
+                  Programado para
+                  <span className="text-[10px] text-accent/60 font-mono bg-brand/10 px-1.5 py-0.5 rounded">{tzAbbr} · {userTimezone}</span>
+                </label>
+                <input type="datetime-local" value={isoToLocalDatetime(formData.starts_at)}
+                  onChange={e => setFormData({ ...formData, starts_at: e.target.value ? new Date(e.target.value).toISOString() : "" })}
+                  className="w-full bg-black/50 border border-line-subtle rounded-xl px-4 py-3 text-foreground-strong focus:outline-none focus:border-accent light:bg-surface-input light:border-line-control/50 light:placeholder:text-foreground-placeholder" />
+                {formData.starts_at && (
+                  <p className="text-[10px] text-foreground-muted/40 flex items-center gap-1">
+                    <Clock size={10} /> Guardado en UTC:{' '}
+                    {new Date(formData.starts_at).toISOString().replace("T", " ").slice(0, 19)}Z
+                  </p>
+                )}
+              </div>
+              <div className="md:col-span-2 space-y-2">
+                <label className="text-sm font-semibold text-foreground-muted">Descripción</label>
+                <textarea value={formData.description || ""}
+                  onChange={e => setFormData({ ...formData, description: e.target.value })}
+                  rows={2}
+                  className="w-full bg-black/50 border border-line-subtle rounded-xl px-4 py-3 text-foreground-strong focus:outline-none focus:border-accent resize-none light:bg-surface-input light:border-line-control/50 light:placeholder:text-foreground-placeholder" />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-semibold text-foreground-muted">Planes con acceso</label>
+                <div className="flex flex-wrap items-center gap-2 bg-black/50 border border-line-subtle rounded-xl px-4 py-3 min-h-[50px] light:bg-surface-panel">
+                  {["free", "individual", "vip"].map(plan => {
+                    const isSelected = formData.allowed_plans?.includes(plan as "free" | "individual" | "vip");
+                    return (
+                      <button
+                        key={plan}
+                        type="button"
+                        onClick={() => {
+                          const plans = formData.allowed_plans || [];
+                          const p = plan as "free" | "individual" | "vip";
+                          const next = plans.includes(p) ? plans.filter(x => x !== p) : [...plans, p];
+                          setFormData({ ...formData, allowed_plans: next });
+                        }}
+                        className={cn(
+                          "px-4 py-2 rounded-lg text-sm font-bold transition-all border",
+                          isSelected
+                            ? plan === "free" ? "bg-green-500/15 text-green-400 light:text-success border-green-500/30 shadow-[0_0_10px_rgba(34,197,94,0.1)]"
+                              : plan === "individual" ? "bg-blue-500/15 text-blue-400 light:text-info border-blue-500/30 shadow-[0_0_10px_rgba(59,130,246,0.1)]"
+                              : "bg-purple-500/15 text-violet border-purple-500/30 shadow-[0_0_10px_rgba(168,85,247,0.1)]"
+                            : "bg-ink/5 text-fg-40 border-line-subtle hover:border-ink/30 hover:text-fg-70"
+                        )}
+                      >
+                        {plan === "free" ? "Gratuito" : plan === "individual" ? "Individual" : "VIP"}
+                      </button>
+                    );
+                  })}
+                </div>
+                <p className="text-[10px] text-foreground-muted/50 light:text-fg-40 flex items-center gap-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-brand/50" />
+                  El plan más alto seleccionado se usa como <code className="text-accent">required_plan</code> automáticamente.
+                </p>
+              </div>
+            </div>
+          </div>
+
+          {/* Cloudflare Stream ID */}
+          <div className="bg-surface-page border border-line-subtle rounded-2xl p-6">
+            <h3 className="text-lg font-bold text-foreground-strong mb-4 flex items-center gap-2">
+              <Monitor size={18} className="text-accent" /> Configuración de Transmisión (OBS)
+            </h3>
+            <div className="space-y-2">
+              <label className="text-sm font-semibold text-foreground-muted flex items-center justify-between">
+                Cloudflare Live Input ID
+                {!customInputId && formData.stream_live_input_id === PRESET_INPUT_IDS[0]?.value && (
+                  <span className="text-[10px] bg-green-500/10 text-green-400 light:text-success border border-green-500/20 px-2 py-0.5 rounded-full font-mono">
+                    ✓ Predeterminado
+                  </span>
+                )}
+                {customInputId && (
+                  <span className="text-[10px] bg-brand/10 text-accent border border-brand/20 px-2 py-0.5 rounded-full font-mono">
+                    Personalizado
+                  </span>
+                )}
+              </label>
+              <select value={customInputId ? "__custom__" : (formData.stream_live_input_id || "")}
+                onChange={e => {
+                  if (e.target.value === "__custom__") {
+                    setCustomInputId(true);
+                    setFormData({ ...formData, stream_live_input_id: "" });
+                  } else {
+                    setCustomInputId(false);
+                    setFormData({ ...formData, stream_live_input_id: e.target.value });
+                  }
+                }}
+                className="w-full bg-black/50 border border-line-subtle rounded-xl px-4 py-3 text-foreground-strong focus:outline-none focus:border-accent font-mono text-sm appearance-none cursor-pointer light:bg-surface-input light:border-line-control/50 light:placeholder:text-foreground-placeholder">
+                {PRESET_INPUT_IDS.map(p => (
+                  <option key={p.value} value={p.value} className="bg-black text-foreground-strong light:bg-surface-panel">{p.label}</option>
+                ))}
+                <option value="__custom__" className="bg-black text-foreground-strong light:bg-surface-panel">— Personalizado —</option>
+              </select>
+              {customInputId && (
+                <input type="text" placeholder="Ej: 595f2bfac6285d604cf136e049c37b08"
+                  value={formData.stream_live_input_id || ""}
+                  onChange={e => setFormData({ ...formData, stream_live_input_id: e.target.value })}
+                  className="w-full bg-black/50 border border-line-subtle rounded-xl px-4 py-3 text-foreground-strong focus:outline-none focus:border-accent font-mono text-sm mt-2 light:bg-surface-input light:border-line-control/50 light:placeholder:text-foreground-placeholder" />
+              )}
+              <p className="text-[10px] text-foreground-muted/50 light:text-fg-40 flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-green-500/50" /> 
+                El Input ID principal está preconfigurado. Usa "Personalizado" solo si creaste otro Live Input en Cloudflare.
+              </p>
+            </div>
+
+            <div className="space-y-2 mt-4 pt-4 border-t border-line-subtle">
+              <label className="text-sm font-semibold text-foreground-muted">Grabación del directo (Cloudflare Stream UID)</label>
+              <div className="flex gap-2">
+                <input type="text" placeholder="Automático después de finalizar"
+                  value={formData.recording_stream_uid || ""}
+                  onChange={e => setFormData({ ...formData, recording_stream_uid: e.target.value })}
+                  className="flex-1 bg-black/50 border border-line-subtle rounded-xl px-4 py-3 text-foreground-strong focus:outline-none focus:border-accent font-mono text-sm light:bg-surface-input light:border-line-control/50 light:placeholder:text-foreground-placeholder" />
+                <button onClick={async () => {
+                  if (!activeLive?.stream_live_input_id) { toast.error("Primero configura el Live Input ID"); return; }
+                  toast.info("Buscando grabación en Cloudflare...");
+                  const result = await fetchRecording(activeLive.stream_live_input_id, { startsAt: activeLive.starts_at });
+                  if (result.recording_uid) {
+                    setFormData(prev => ({ ...prev, recording_stream_uid: result.recording_uid }));
+                    toast.success("Grabación encontrada y vinculada");
+                  } else {
+                    toast.error(result.message || "Cloudflare aún no ha generado la grabación. Inténtalo de nuevo en unos minutos.");
+                  }
+                }}
+                  className="bg-ink/10 hover:bg-ink/20 text-foreground-strong px-3 py-3 rounded-xl flex items-center gap-1.5 text-xs font-bold transition-colors shrink-0 whitespace-nowrap">
+                  <Video size={14} /> Obtener grabación
+                </button>
+                {formData.recording_stream_uid && (
+                  <button type="button" onClick={() => handleDownloadRecording(formData.recording_stream_uid!)}
+                    className="bg-brand/10 hover:bg-brand/20 border border-brand/20 text-accent px-3 py-3 rounded-xl flex items-center gap-1.5 text-xs font-bold transition-colors shrink-0">
+                    <Download size={14} /> Descargar
+                  </button>
+                )}
+              </div>
+              <p className="text-[10px] text-foreground-muted/50 light:text-fg-40">Al finalizar el directo, haz clic en "Obtener grabación" para vincularla automáticamente. Sin necesidad de ir a Cloudflare.</p>
+            </div>
+
+            <details className="mt-4 group">
+              <summary className="text-sm text-accent font-semibold cursor-pointer hover:text-accent-hover transition-colors flex items-center gap-2">
+                <Clock size={14} /> ¿Cómo configurar OBS Studio?
+              </summary>
+              <div className="mt-4 p-4 bg-black/40 border border-line-subtle rounded-xl space-y-3 text-sm text-fg-80 light:bg-surface-panel">
+                <p className="flex items-start gap-2 text-amber-300/90 light:text-warning">
+                  <span>⚠️</span>
+                  <span>Lo MÁS importante para que el vivo no se corte: transmite por <strong>cable de red (ethernet)</strong>, nunca por WiFi, y usa un bitrate que tu subida soporte. Un corte de conexión = el vivo se congela y la grabación se fragmenta en videos sueltos.</span>
+                </p>
+
+                <p>1. En OBS: <strong>Configuración → Transmisión</strong></p>
+                <div className="pl-4 space-y-1 text-foreground-muted">
+                  <p>• Servicio: <strong>Personalizado (Custom)</strong></p>
+                  <p>• Servidor: <span className="text-accent font-mono text-xs">rtmps://live.cloudflare.com:443/live/</span>
+                    <button onClick={() => copyToClipboard("rtmps://live.cloudflare.com:443/live/", "Servidor RTMPS")}
+                      className="inline ml-2 text-accent hover:text-accent-hover"><Copy size={14} className="inline" /></button>
+                  </p>
+                  <p>• Clave de transmisión: <strong>el Live Input ID de arriba</strong></p>
+                </div>
+
+                <p>2. <strong>Configuración → Salida</strong> → Modo de salida: <strong>Avanzado</strong></p>
+                <div className="pl-4 space-y-1 text-foreground-muted">
+                  <p>• Codificador: <strong>x264</strong> (o NVENC H.264 si tienes GPU Nvidia)</p>
+                  <p>• Control de tasa: <strong>CBR</strong></p>
+                  <p>• Intervalo de keyframe: <strong>2</strong> (obligatorio — en <strong>Auto</strong> la grabación falla al codificar)</p>
+                  <p>• Preajuste de uso de CPU: <strong>veryfast</strong> · Perfil: <strong>main</strong></p>
+                </div>
+
+                <p>3. Bitrate según tu subida REAL (medila antes en <span className="text-accent">fast.com</span>):</p>
+                <div className="pl-4 space-y-1 text-foreground-muted">
+                  <p>• Subida &lt; 5 Mbps → <strong>2.500 Kbps</strong> a 720p30</p>
+                  <p>• Subida 5-10 Mbps → <strong>4.000 Kbps</strong> a 1080p30</p>
+                  <p>• Subida &gt; 10 Mbps estable → <strong>6.000 Kbps</strong> a 1080p30</p>
+                  <p className="text-amber-300/70 light:text-warning">Regla de oro: el bitrate no debe pasar el <strong>50%</strong> de tu subida real. Ante la duda, bajalo: fluido y estable &gt; alta calidad que se corta.</p>
+                </div>
+
+                <p>4. <strong>Configuración → Video</strong></p>
+                <div className="pl-4 space-y-1 text-foreground-muted">
+                  <p>• Resolución de salida: <strong>1920x1080</strong> (o 1280x720 si tu subida es baja)</p>
+                  <p>• FPS: <strong>30</strong> (nunca 60 para un vivo largo)</p>
+                </div>
+
+                <p>5. (Opcional) Menor latencia: en el Live Input de Cloudflare activa <strong>Low-Latency HLS</strong> (~3-5s). No actives WebRTC salvo que lo necesites — suma inestabilidad.</p>
+
+                <p>6. En OBS <strong>Iniciar transmisión</strong>, espera a que la señal esté estable unos segundos y solo entonces activa <strong>"Forzar EN VIVO"</strong> abajo.</p>
+
+                <p className="text-fg-50 text-[11px] pt-1">Durante el vivo revisa el recuadro de estado de OBS (abajo a la derecha): <strong>verde</strong> = conexión sana. Si parpadea en <strong>amarillo/rojo</strong> estás perdiendo frames → baja el bitrate.</p>
+              </div>
+            </details>
+          </div>
+
+          {/* Background Image */}
+          <div className="bg-surface-page border border-line-subtle rounded-2xl p-6">
+            <h3 className="text-lg font-bold text-foreground-strong mb-4 flex items-center gap-2">
+              <ImageIcon size={18} className="text-accent" /> Fondo de Sala de Espera
+            </h3>
+            <div className="flex flex-col md:flex-row gap-6">
+              <div className="flex-1 space-y-2">
+                <label className="text-sm font-semibold text-foreground-muted">URL de la imagen</label>
+                <input type="text" value={formData.background_image_url || ""}
+                  onChange={e => setFormData({ ...formData, background_image_url: e.target.value })}
+                  placeholder="https://..."
+                  className="w-full bg-black/50 border border-line-subtle rounded-xl px-4 py-3 text-foreground-strong focus:outline-none focus:border-accent text-sm light:bg-surface-input light:border-line-control/50 light:placeholder:text-foreground-placeholder" />
+                <div className="relative">
+                  <div
+                    onDragOver={e => { e.preventDefault(); e.currentTarget.classList.add("border-accent"); }}
+                    onDragLeave={e => { e.currentTarget.classList.remove("border-accent"); }}
+                    onDrop={async e => {
+                      e.preventDefault();
+                      e.currentTarget.classList.remove("border-accent");
+                      const file = e.dataTransfer.files?.[0];
+                      if (!file) return;
+                      if (!file.type.startsWith("image/")) { toast.error("Solo imágenes"); return; }
+                      await uploadBackground(file);
+                    }}
+                    className="mt-2 border-2 border-dashed border-line-subtle rounded-xl p-6 text-center cursor-pointer hover:border-brand/50 transition-colors"
+                  >
+                    <input
+                      type="file"
+                      accept="image/*"
+                      id="bg-upload"
+                      className="hidden"
+                      onChange={async e => {
+                        const file = e.target.files?.[0];
+                        if (!file) return;
+                        await uploadBackground(file);
+                        e.target.value = "";
+                      }}
+                    />
+                    <label htmlFor="bg-upload" className="cursor-pointer block">
+                      <Upload size={24} className="mx-auto text-foreground-muted mb-2" />
+                      <p className="text-sm text-foreground-muted">Arrastra una imagen o <span className="text-accent font-semibold">haz clic</span> para subir</p>
+                      <p className="text-[10px] text-foreground-muted/50 light:text-fg-40 mt-1">Recomendado: 1920×1080, max 5MB</p>
+                    </label>
+                  </div>
+                </div>
+              </div>
+              {/* Isla oscura: vista previa de imagen, la etiqueta va sobre la foto. */}
+              <div data-theme="dark" className="w-full md:w-64 h-48 rounded-xl border border-ink/20 overflow-hidden bg-black shrink-0 relative flex items-center justify-center">
+                {formData.background_image_url ? (
+                  <img src={formData.background_image_url} alt="Preview" className="absolute inset-0 w-full h-full object-cover opacity-60" />
+                ) : (
+                  <ImageIcon size={32} className="text-fg-20" />
+                )}
+                <div className="absolute bottom-2 left-2 z-10">
+                  <span className="text-[10px] font-bold bg-black/80 px-2 py-1 rounded-lg text-fg-80 backdrop-blur-md border border-line-subtle">Vista Previa</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {activeTab === "editor" && !activeLive && (
+        <div className="text-center py-20 text-foreground-muted bg-surface-page rounded-2xl border border-ink/5 relative overflow-hidden group">
+          <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-48 h-48 bg-brand/5 rounded-full blur-3xl group-hover:bg-brand/10 transition-colors" />
+          <div className="relative z-10">
+            <Radio size={48} className="mx-auto mb-4 opacity-30 text-fg-30" />
+            <p className="text-lg font-semibold text-fg-70">No hay salas activas</p>
+            <p className="text-sm mt-2 max-w-sm mx-auto">
+              Selecciona una sala de la pestaña <strong className="text-fg-50">Salas</strong> o crea una nueva para empezar.
+            </p>
+            <button onClick={handleCreateNew} disabled={isSaving}
+              className="mt-6 bg-brand hover:bg-brand-hover text-on-brand px-6 py-3 rounded-xl font-bold inline-flex items-center gap-2 transition-all shadow-lg shadow-brand/20">
+              <Plus size={18} /> Crear primera sala
+            </button>
+          </div>
+        </div>
+      )}
+
+      {activeTab === "rooms" && (
+        <div className="space-y-3">
+          <div className="flex items-start gap-3 p-4 bg-ink/[0.03] border border-line-subtle rounded-xl light:bg-surface-panel light:shadow-panel">
+            <div className="shrink-0 w-9 h-9 rounded-lg bg-brand/10 border border-brand/20 flex items-center justify-center">
+              <Info size={16} className="text-accent" />
+            </div>
+            <div className="min-w-0 flex-1 space-y-1.5">
+              <p className="text-sm font-semibold text-foreground-strong">Solo una sala puede estar activa a la vez</p>
+              <ul className="text-sm text-foreground-muted space-y-1 leading-relaxed">
+                <li className="flex gap-2">
+                  <span className="text-accent/60 shrink-0">•</span>
+                  <span>La sala <span className="text-green-400 light:text-success font-semibold">Activa</span> es la que ven los usuarios en su dashboard y en <code className="text-accent bg-black/40 px-1.5 py-0.5 rounded text-xs light:bg-surface-panel">/vip-live</code>.</span>
+                </li>
+                <li className="flex gap-2">
+                  <span className="text-accent/60 shrink-0">•</span>
+                  <span>Haz clic en el botón <span className="text-foreground-strong font-semibold">Activa/Inactiva</span> de cada sala para cambiar cuál se publica.</span>
+                </li>
+                <li className="flex gap-2">
+                  <span className="text-accent/60 shrink-0">•</span>
+                  <span>Activar una sala desactiva automáticamente la anterior.</span>
+                </li>
+              </ul>
+            </div>
+          </div>
+          {lives.length === 0 ? (
+            <div className="text-center py-12 text-foreground-muted bg-surface-page rounded-xl border border-ink/5">
+              No hay salas creadas
+            </div>
+          ) : (
+            lives.map(live => (
+              <div key={live.id}
+                className={cn("bg-black/50 border rounded-xl p-3 sm:p-4 flex flex-col gap-3 group transition-all light:bg-surface-panel", activeLive?.id === live.id ? "border-brand/40 bg-brand/5" : "border-line-subtle")}>
+              <div
+                className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 cursor-pointer hover:bg-ink/[0.03] -m-1 p-1 rounded-lg"
+                onClick={() => selectRoom(live)}>
+                <div className="flex items-start sm:items-center gap-3 sm:gap-4 min-w-0 flex-1">
+                  <div className={cn("w-3 h-3 rounded-full shrink-0 mt-1.5 sm:mt-0",
+                    live.status === "live" && !live.is_paused ? "bg-red-500 animate-pulse shadow-[0_0_10px_red]" :
+                    live.is_paused ? "bg-yellow-500 animate-pulse" :
+                    live.starts_at ? "bg-brand/50" : "bg-gray-600")} />
+                  {live.is_active && (
+                    <span className="text-[8px] font-bold uppercase tracking-wider bg-green-500/15 text-green-400 light:text-success border border-green-500/30 px-1.5 py-0.5 rounded-full shrink-0 mt-1 sm:mt-0">
+                      Activa
+                    </span>
+                  )}
+                  <div className="min-w-0 flex-1">
+                    <h4 className="text-foreground-strong font-bold text-sm sm:text-base truncate">{live.title || "Sin título"}</h4>
+                    <div className="flex flex-wrap gap-1.5 sm:gap-2 mt-1 items-center">
+                      {live.starts_at && (
+                        <span className="text-[10px] text-fg-40 flex items-center gap-1">
+                          <Calendar size={10} /> {new Date(live.starts_at).toLocaleDateString("es-CO", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}
+                        </span>
+                      )}
+                      {live.allowed_plans?.map(plan => (
+                        <span key={plan} className="text-[9px] uppercase font-bold px-1.5 py-0.5 rounded bg-ink/10 text-fg-60">{plan}</span>
+                      ))}
+                      {live.status === "live" && !live.is_paused && <span className="text-[10px] text-danger font-bold">EN VIVO</span>}
+                      {live.is_paused && <span className="text-[10px] text-yellow-400 light:text-warning font-bold">PAUSADO</span>}
+                    </div>
+                  </div>
+                </div>
+                <div className="flex items-center justify-end gap-2 shrink-0">
+                  {/* Toggle Activo/Inactivo */}
+                  <button
+                    onClick={async e => {
+                      e.stopPropagation();
+                      if (live.is_active) {
+                        // Desactivar esta sala
+                        try {
+                          await deactivateAllLives();
+                          setLives(prev => prev.map(l => ({ ...l, is_active: false })));
+                          if (activeLive?.id === live.id) {
+                            setActiveLive(null);
+                            setFormData({
+                              title: "", description: "", stream_live_input_id: PRESET_INPUT_IDS[0]?.value || "", starts_at: "",
+                              background_image_url: "", allowed_plans: ["vip"], status: "scheduled",
+                              required_plan: "vip", duration_minutes: null, is_active: false, is_paused: false,
+                            });
+                            setCustomInputId(false);
+                          }
+                          toast.success(`"${live.title || "Sala"}" desactivada`);
+                        } catch { toast.error("Error al desactivar"); }
+                      } else {
+                        // Activar esta sala
+                        try {
+                          const updated = await apiSetActiveLive(live.id);
+                          setLives(prev => prev.map(l => ({ ...l, is_active: l.id === updated.id })));
+                          setActiveLive(updated);
+                          setFormData(updated);
+                          setCustomInputId(!PRESET_INPUT_IDS.some(p => p.value === updated.stream_live_input_id));
+                          toast.success(`"${live.title || "Sala"}" activada`);
+                        } catch { toast.error("Error al activar sala"); }
+                      }
+                    }}
+                    className={cn(
+                      "flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-bold transition-all border",
+                      live.is_active
+                        ? "bg-green-500/15 text-green-400 light:text-success border-green-500/30 shadow-[0_0_10px_rgba(34,197,94,0.1)]"
+                        : "bg-ink/5 text-fg-40 border-line-subtle hover:border-ink/30 hover:text-fg-70"
+                    )}
+                    title={live.is_active ? "Desactivar sala" : "Activar sala"}
+                  >
+                    <span className={cn("w-2 h-2 rounded-full", live.is_active ? "bg-green-400 shadow-[0_0_6px_rgba(34,197,94,0.5)]" : "bg-ink/20")} />
+                    {live.is_active ? "Activa" : "Inactiva"}
+                  </button>
+                  <button onClick={e => { e.stopPropagation(); handleDelete(live.id); }}
+                    className="p-2 text-red-500/50 light:text-danger hover:text-danger bg-red-500/5 rounded-lg hover:bg-red-500/20 transition-colors">
+                    <Trash2 size={16} />
+                  </button>
+                </div>
+              </div>
+
+              <PublicLinkControl
+                live={live}
+                togglingPublicId={togglingPublicId}
+                setTogglingPublicId={setTogglingPublicId}
+                onUpdated={updated => setLives(prev => prev.map(l => l.id === updated.id ? updated : l))}
+              />
+              </div>
+            ))
+          )}
+        </div>
+      )}
+
+      {activeTab === "ended" && (
+        <div className="space-y-4">
+          {endedLives.length === 0 ? (
+            <div className="text-center py-12 text-foreground-muted bg-surface-page rounded-xl border border-ink/5">
+              <Video size={40} className="mx-auto mb-4 opacity-30" />
+              <p className="text-lg font-semibold text-fg-70">No hay transmisiones finalizadas</p>
+              <p className="text-sm mt-1">Las grabaciones aparecerán aquí después de finalizar un en vivo.</p>
+            </div>
+          ) : (
+            endedLives.map(live => (
+              <div key={live.id}
+                className="bg-surface-page border border-line-subtle rounded-2xl p-4 sm:p-6 space-y-4">
+                <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3 md:gap-4">
+                  <div className="flex items-start sm:items-center gap-3 sm:gap-4 min-w-0 flex-1">
+                    <div className="w-3 h-3 rounded-full bg-gray-600 shrink-0 mt-2 sm:mt-0" />
+                    <div className="min-w-0 flex-1">
+                      {renamingId === live.id ? (
+                        <div className="flex items-center gap-2">
+                          <input
+                            autoFocus
+                            value={renameValue}
+                            onChange={e => setRenameValue(e.target.value)}
+                            onKeyDown={e => {
+                              if (e.key === "Enter") { e.preventDefault(); handleRename(live); }
+                              if (e.key === "Escape") { e.preventDefault(); cancelRename(); }
+                            }}
+                            maxLength={200}
+                            aria-label="Nombre de la grabación"
+                            className="min-w-0 flex-1 bg-black/40 border border-brand/30 focus:border-accent outline-none rounded-lg px-3 py-1.5 text-foreground-strong font-bold text-base sm:text-lg light:bg-surface-input light:border-line-control/50 light:placeholder:text-foreground-placeholder"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => handleRename(live)}
+                            disabled={savingRename}
+                            aria-label="Guardar nombre"
+                            className="p-2 rounded-lg bg-brand/10 hover:bg-brand/20 border border-brand/25 text-accent transition-colors disabled:opacity-50 shrink-0"
+                          >
+                            <Check size={16} />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={cancelRename}
+                            disabled={savingRename}
+                            aria-label="Cancelar"
+                            className="p-2 rounded-lg bg-ink/5 hover:bg-ink/10 border border-line-subtle text-fg-60 transition-colors disabled:opacity-50 shrink-0"
+                          >
+                            <X size={16} />
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="flex items-center gap-2 min-w-0">
+                          <h4 className="text-foreground-strong font-bold text-base sm:text-lg truncate">{live.title || "Sin título"}</h4>
+                          <button
+                            type="button"
+                            onClick={e => { e.stopPropagation(); startRename(live); }}
+                            aria-label="Renombrar grabación"
+                            title="Renombrar grabación"
+                            className="p-1.5 rounded-lg text-fg-40 hover:text-accent hover:bg-brand/10 transition-colors shrink-0"
+                          >
+                            <Pencil size={14} />
+                          </button>
+                        </div>
+                      )}
+                      <div className="flex flex-wrap gap-1.5 sm:gap-2 mt-1 items-center text-xs text-foreground-muted">
+                        {live.starts_at && (
+                          <span className="flex items-center gap-1">
+                            <Calendar size={12} /> {new Date(live.starts_at).toLocaleDateString("es-CO", { day: "numeric", month: "long", year: "numeric", hour: "2-digit", minute: "2-digit" })}
+                          </span>
+                        )}
+                        <span className="text-[9px] uppercase px-1.5 py-0.5 rounded bg-black/40 text-fg-40 light:bg-surface-panel">Finalizado</span>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-2 shrink-0">
+                    {live.recording_storage === "r2" && live.recording_r2_key ? (
+                      <button type="button" onClick={() => handleDownloadR2(live.id)}
+                        className="flex-1 sm:flex-none bg-brand/10 hover:bg-brand/20 border border-brand/20 text-accent px-3 sm:px-4 py-2 rounded-xl flex items-center justify-center gap-2 text-xs sm:text-sm font-bold transition-colors whitespace-nowrap">
+                        <Download size={16} /> <span className="hidden sm:inline">Descargar grabación</span><span className="sm:hidden">Descargar</span>
+                      </button>
+                    ) : live.recording_stream_uid ? (
+                      <>
+                        <button type="button" onClick={() => handleDownloadRecording(live.recording_stream_uid!)}
+                          className="flex-1 sm:flex-none bg-brand/10 hover:bg-brand/20 border border-brand/20 text-accent px-3 sm:px-4 py-2 rounded-xl flex items-center justify-center gap-2 text-xs sm:text-sm font-bold transition-colors whitespace-nowrap">
+                          <Download size={16} /> <span className="hidden sm:inline">Descargar grabación</span><span className="sm:hidden">Descargar</span>
+                        </button>
+                        {/* `archived_at` cargado con storage 'stream' = ya se intentó y Stream no
+                            puede convertirla a MP4 (supera la duración máxima). No insistir. */}
+                        {!isKeptInStream(live) && (
+                          <button type="button" onClick={() => handleArchive(live)} disabled={archivingId === live.id}
+                            title="Copia la grabación a R2 y la borra de Stream para dejar de pagar storage"
+                            className="flex-1 sm:flex-none bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/25 text-success px-3 sm:px-4 py-2 rounded-xl flex items-center justify-center gap-2 text-xs sm:text-sm font-bold transition-colors whitespace-nowrap disabled:opacity-50">
+                            <Archive size={16} /> <span className="hidden sm:inline">{archivingId === live.id ? "Archivando..." : "Archivar en R2"}</span><span className="sm:hidden">Archivar</span>
+                          </button>
+                        )}
+                      </>
+                    ) : null}
+                    <button onClick={async e => {
+                      e.stopPropagation();
+                      try {
+                        await updateLive(live.id, { status: "scheduled" });
+                        const fresh = await apiSetActiveLive(live.id);
+                        setLives(prev => [...prev, fresh]);
+                        setEndedLives(prev => prev.filter(l => l.id !== live.id));
+                        setActiveLive(fresh);
+                        setFormData(fresh);
+                        setActiveTab("editor");
+                        toast.success(`"${live.title || "Sala"}" movida a salas activas`);
+                      } catch { toast.error("Error al reactivar"); }
+                    }} className="flex-1 sm:flex-none bg-ink/10 hover:bg-ink/20 text-foreground-strong px-3 sm:px-4 py-2 rounded-xl flex items-center justify-center gap-2 text-xs sm:text-sm font-bold transition-colors whitespace-nowrap">
+                      <PlayCircle size={16} /> Reactivar
+                    </button>
+                    <button onClick={e => { e.stopPropagation(); handleDelete(live.id); }}
+                      aria-label="Eliminar"
+                      className="p-2 text-red-500/70 light:text-danger hover:text-danger bg-red-500/5 rounded-lg hover:bg-red-500/20 transition-colors shrink-0">
+                      <Trash2 size={16} />
+                    </button>
+                  </div>
+                </div>
+                {(live.recording_storage === "r2" && live.recording_r2_key) || live.recording_stream_uid ? (
+                  <div className="space-y-2">
+                    <RecordingPlayer live={live} />
+                    <div className="flex items-center gap-2 text-[10px] text-foreground-muted/60">
+                      {live.recording_storage === "r2" ? (
+                        <span className="inline-flex items-center gap-1 text-emerald-400/80 light:text-success">
+                          <Archive size={11} /> Archivada en R2 (sin costo recurrente)
+                        </span>
+                      ) : isKeptInStream(live) ? (
+                        <span className="inline-flex items-center gap-1 text-amber-400/70 light:text-warning">
+                          <Info size={11} /> Supera las 4 h — se archiva por el carril largo en segundo plano; si en unas horas sigue aquí, revisa la Action en GitHub
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 text-amber-400/70 light:text-warning">
+                          <Video size={11} /> En Cloudflare Stream — archívala en R2 para dejar de pagar almacenamiento
+                        </span>
+                      )}
+                      {live.recording_duration_seconds != null && (
+                        <span>· {Math.round(live.recording_duration_seconds / 60)} min</span>
+                      )}
+                      {/* Si quedó vinculada la grabación equivocada (p. ej. una reconexión
+                          corta de OBS), esto permite corregirla sin reactivar la sala. */}
+                      {live.stream_live_input_id && (
+                        <button
+                          type="button"
+                          onClick={() => handleLinkRecording(live)}
+                          disabled={linkingId === live.id}
+                          className="ml-auto shrink-0 text-[10px] text-fg-40 hover:text-accent underline underline-offset-2 transition-colors disabled:opacity-50"
+                        >
+                          {linkingId === live.id ? "Buscando..." : "Cambiar grabación"}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="aspect-video bg-black/40 light:bg-surface-subtle rounded-xl flex flex-col items-center justify-center gap-4 border border-dashed border-line-subtle">
+                    <div className="text-center">
+                      <Video size={32} className="mx-auto text-fg-20 mb-2" />
+                      <p className="text-sm text-foreground-muted">Sin grabación disponible</p>
+                      <p className="text-[10px] text-foreground-muted/50 light:text-fg-40 mt-1">
+                        {live.stream_live_input_id
+                          ? "Cloudflare puede tardar unos minutos en procesarla tras finalizar."
+                          : "Este evento no tiene un Live Input configurado."}
+                      </p>
+                    </div>
+                    {live.stream_live_input_id && (
+                      <button
+                        type="button"
+                        onClick={() => handleLinkRecording(live)}
+                        disabled={linkingId === live.id}
+                        className="bg-brand/10 hover:bg-brand/20 border border-brand/30 text-accent px-4 py-2 rounded-xl flex items-center gap-2 text-sm font-bold transition-colors disabled:opacity-50"
+                      >
+                        <Video size={16} /> {linkingId === live.id ? "Buscando..." : "Vincular grabación"}
+                      </button>
+                    )}
+                  </div>
+                )}
+                <PublicLinkControl
+                  live={live}
+                  togglingPublicId={togglingPublicId}
+                  setTogglingPublicId={setTogglingPublicId}
+                  onUpdated={updated => setEndedLives(prev => prev.map(l => l.id === updated.id ? updated : l))}
+                />
+              </div>
+            ))
+          )}
+        </div>
+      )}
+
+      {/* Selector de grabación — aparece cuando el Live Input tiene más de una
+          transmisión. La primera es la más larga: casi siempre es el vivo real. */}
+      <Dialog open={!!recordingPicker} onOpenChange={open => { if (!open) setRecordingPicker(null); }}>
+        <DialogContent className="bg-surface-page border-line-subtle sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="text-foreground-strong">Elige la grabación</DialogTitle>
+            <DialogDescription className="text-foreground-muted">
+              Este Live Input tiene {recordingPicker?.recordings.length} transmisiones grabadas.
+              Cada corte y reconexión de OBS genera una. La más larga suele ser el vivo real.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-2 mt-2 max-h-[50dvh] overflow-y-auto overscroll-contain" data-lenis-prevent>
+            {recordingPicker?.recordings.map((rec, i) => {
+              const minutes = Math.floor(rec.duration / 60);
+              const seconds = Math.round(rec.duration % 60);
+              const isCurrent = recordingPicker.live.recording_stream_uid === rec.uid;
+              return (
+                <button
+                  key={rec.uid}
+                  type="button"
+                  onClick={() => handlePickRecording(rec)}
+                  disabled={pickingUid !== null}
+                  className={cn(
+                    "w-full text-left p-3 rounded-xl border transition-colors disabled:opacity-50",
+                    i === 0
+                      ? "border-brand/40 bg-brand/5 hover:bg-brand/10"
+                      : "border-line-subtle bg-ink/[0.02] hover:bg-ink/5 light:bg-surface-panel light:hover:bg-surface-subtle"
+                  )}
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-foreground-strong font-bold text-sm tabular-nums">
+                      {minutes}:{seconds.toString().padStart(2, "0")} min
+                    </span>
+                    <span className="flex items-center gap-2 shrink-0">
+                      {i === 0 && (
+                        <span className="text-[9px] uppercase tracking-wider text-accent bg-brand/10 border border-brand/20 px-2 py-0.5 rounded-full">
+                          Sugerida
+                        </span>
+                      )}
+                      {isCurrent && (
+                        <span className="text-[9px] uppercase tracking-wider text-success bg-emerald-500/10 border border-emerald-500/20 px-2 py-0.5 rounded-full">
+                          Vinculada
+                        </span>
+                      )}
+                      {pickingUid === rec.uid && (
+                        <span className="text-[10px] text-foreground-muted">Vinculando...</span>
+                      )}
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-foreground-muted mt-1">
+                    {rec.created
+                      ? new Date(rec.created).toLocaleString("es-CO", {
+                          day: "numeric", month: "long", hour: "2-digit", minute: "2-digit",
+                        })
+                      : "Sin fecha"}
+                  </p>
+                  <p className="text-[10px] text-foreground-muted/50 light:text-fg-40 font-mono truncate mt-0.5">{rec.uid}</p>
+                </button>
+              );
+            })}
+          </div>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+};
+
+export default AdminLiveManager;

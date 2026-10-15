@@ -1,0 +1,180 @@
+# Pendientes — Tracker de tareas
+
+> Lista viva de mejoras/verificaciones en curso. Actualizar estado a medida que se cierran.
+> Estados: 🔴 pendiente · 🟡 en progreso · 🟢 hecho · ⚪ bloqueado (falta info)
+
+_Última actualización: 2026-10-13 (propuesta documental de Clase completa, comunidad y calidad; estados anteriores conservados)_
+
+---
+
+## 1. Descargar grabación — verificar que funcione 🟢
+
+**Resuelto (2026-07-08):**
+- `api/stream/download-status.ts` ahora se auto-cura: si el MP4 nunca se pidió (`default` ausente), hace `POST /downloads` para habilitarlo y devuelve `status: 'inprogress'`. Antes solo consultaba (`GET`) y el video quedaba "preparando" para siempre.
+- `AdminLiveManager.tsx`: el toast ahora dice "Cloudflare está generando el MP4… %" en vez del mensaje muerto; se maneja `status: 'error'`; el fallback directo (`openDownloadFallback`) ya no arma `https:///` roto cuando falta el subdominio — avisa con un error claro.
+- `npm run typecheck` ✅
+
+**Nota de config:** `VITE_CLOUDFLARE_STREAM_CUSTOMER_SUBDOMAIN` no está en ningún `env.example` (no existe ese archivo; sí está declarada en `src/vite-env.d.ts` y usada en `AdminLiveManager` y `VIPLiveRoom`). Con el fix, esa var solo hace falta para el fallback directo — el camino principal ahora va por la API. Igual conviene tenerla seteada en Vercel.
+
+**Archivos:** `api/stream/download-status.ts`, `src/pages/admin/AdminLiveManager.tsx`
+
+---ace
+
+## 2. Finalizar en vivo — que guarde correctamente 🔴
+
+**Estado:** el guardado principal funciona (`status: "ended"` + `recording_stream_uid` se persisten).
+
+**Peros encontrados:**
+- El Finalizar (`AdminLiveManager.tsx` ~648) **no setea `is_active: false`** → la sala queda `is_active = true` en la DB aunque ya esté finalizada.
+- El botón Finalizar **solo se ve en estado `live`**. Si OBS se desconecta → `is_paused = true` → solo aparece "Reanudar". No se puede finalizar una sala pausada sin reanudarla primero.
+
+**Fix propuesto:**
+- Agregar `is_active: false` al `updateLive` del Finalizar.
+- Mostrar "Finalizar" también cuando `is_paused === true`.
+
+**Archivos:** `src/pages/admin/AdminLiveManager.tsx`, `src/lib/api/stream/lives.ts`
+
+---
+
+## 3. Análisis de minutos / costo Cloudflare 🔴
+
+**Regla de negocio:** Cloudflare Stream cobra ~$5 por cada 1000 min **almacenados** + ~$1 por cada 1000 min **entregados**.
+
+**Estado:** **no existe** ninguna agregación de minutos.
+- Las lecciones (`content.ts`) no guardan duración.
+- `lives.duration_minutes` es manual y casi siempre `null`.
+- `recording.ts` recibe `video.duration` (segundos) de Cloudflare pero **no lo persiste**.
+
+**Fix propuesto (feature nuevo):**
+- Guardar la duración de cada video (lección + grabación) al vincularlo.
+- Panel/KPI en admin que sume minutos totales y muestre costo estimado.
+
+> Parcialmente cubierto por el punto 6 (archivado R2): las columnas `recording_bytes` y `recording_duration_seconds` habilitan el tracking de minutos/costo de las grabaciones.
+
+**Archivos:** `src/lib/api/stream/content.ts`, `src/lib/api/admin/metrics.ts`, `api/stream/recording.ts`, migración SQL (columna `duration_seconds` en `lessons`).
+
+---
+
+## 6. Archivado de grabaciones en R2 (ahorro de costos) 🟢
+
+**Objetivo:** mover las grabaciones de Cloudflare Stream (caro, acumulativo) a Cloudflare R2 (egress cero, storage barato) al finalizar el vivo, y borrar de Stream. Ver spec completa en **`docs/RECORDINGS_ARCHITECTURE.md`**.
+
+**Hecho (2026-07-08):**
+- 📄 `docs/RECORDINGS_ARCHITECTURE.md` — spec completa (problema, solución, flujo, costos, componentes).
+- 🗄️ `sql/migrate-recordings-r2.sql` — columnas nuevas en `lives` (`recording_r2_key`, `recording_storage`, `recording_bytes`, `recording_duration_seconds`, `archived_at`) + backfill. **✅ Corrida en Supabase 2026-07-08 (5 columnas confirmadas).**
+- 🧩 Tipo `LiveEvent` actualizado con los campos nuevos. `npm run typecheck` ✅.
+- 🔐 `api/stream/recording-url.ts` — URL firmada de R2 (15 min), gateada por plan. Usa `aws4fetch` (instalado).
+- 🌐 Bucket `escuela-recordings` creado + 4 env R2 en Vercel (cliente, 2026-07-08).
+- ⚙️ `worker/` — Worker completo (copia Stream→R2 + borra de Stream + actualiza `lives`). Escrito, **falta deploy con wrangler**.
+- 🔗 `api/stream/archive-recording.ts` — dispara el Worker (admin).
+- 🖥️ Admin Finalizados: botón "Archivar en R2" + `RecordingPlayer` (video R2 firmado / iframe Stream legacy). `npm run typecheck` ✅ (frontend).
+
+**Completado (2026-07-28):**
+- ✅ Worker deployado + env `ARCHIVE_WORKER_URL`/`ARCHIVE_SHARED_SECRET` en Vercel. Archivado manual verificado end-to-end (copia a R2 + borrado de Stream + replay firmado).
+- ✅ **Archivado automático**: Cron Trigger cada 10 min (`worker/src/index.ts` → `scheduled()`). Ya no hace falta el botón manual.
+- ✅ **Robustez**: descarta grabaciones muertas (Stream `error` o 0% > 12h) para no reintentar ni tapar el cron (`limit=3`).
+- ✅ **Anti-fragmentación**: `timeoutSeconds` en el Live Input (`scripts/configure-live-input.mjs`, por defecto 300 = el valor desplegado, verificado por API el 2026-10-10 y cambiado el 2026-09-19) + guía OBS con keyframe 2.
+
+**Falta (opcional):**
+- Player de replay del alumno (VIPLiveRoom) preferir R2 — revisar si muestra replays.
+- KPI de minutos/costo en admin (los datos ya existen: `recording_bytes`, `recording_duration_seconds`).
+
+**Archivos:** `docs/RECORDINGS_ARCHITECTURE.md`, `sql/migrate-recordings-r2.sql`, `src/lib/api/stream/lives.ts`
+
+---
+
+## 4. Zona inicial de la landing (header + hero) — nueva vida 🟡
+
+**Dirección elegida por el cliente (2026-07-09):** vibe "Aurora dorada envolvente" para toda la zona inicial.
+
+**Hecho:**
+- 🌌 `src/components/feature/AuroraBackground.tsx` — fondo ambiental reutilizable (luces doradas en movimiento, gateado a desktop, mobile con orbe estático).
+- 🦸 `HeroCinematic.tsx` — aurora de fondo + glow pulsante y anillo detrás de la foto de Iván + flotado sutil de la imagen. Header height sincronizado (`5rem` desktop).
+- 🎩 `Header.tsx` — más aire (`h-16 md:h-20`, padding `lg:px-8`) + scroll-aware (translúcido arriba → glass con borde y sombra al bajar).
+- `npm run typecheck` ✅.
+
+**Rework parallax (2026-07-09):** el cliente pidió que el header no parezca una barra separada, estilo web parallax, todo unido.
+- 🎩 `src/components/layout/LandingHeader.tsx` — header dedicado de la landing: flota transparente sobre el hero, se condensa en píldora glass al scrollear, logo con más presencia, botón "Iniciar sesión" premium (gradiente + brillo que barre + flecha).
+- 🌀 `HeroCinematic.tsx` — parallax con `useScroll`/`useTransform`: aurora lenta al fondo, foto sube, contenido baja y se desvanece. Hero a `100svh` con padding superior para el header flotante.
+- 🔁 `Header.tsx` compartido REVERTIDO a su estado original (dashboard/admin lo quieren sólido). Solo la landing usa `LandingHeader`.
+- `LandingPage.tsx` monta `LandingHeader` en vez de `Header`.
+- `npm run typecheck` ✅.
+
+**Falta:** aplicar la misma aurora al login (punto 5b) + validación visual del cliente.
+
+**Archivos:** `src/components/layout/LandingHeader.tsx`, `src/components/feature/AuroraBackground.tsx`, `src/components/feature/HeroCinematic.tsx`, `src/pages/public/LandingPage.tsx`
+
+---
+
+## 5. Logo del inicio de sesión — que se vea correctamente 🟢
+
+**Problema (confirmado con screenshot):** el logo dorado se camuflaba sobre el panel dorado del login (oro-sobre-oro, sin contraste).
+
+**Resuelto (2026-07-09):**
+- Medallón oscuro con glow detrás del logo en `WelcomePanel` (`AuthPage.tsx`) → el logo dorado resalta sobre fondo negro.
+- Cambio a `logoLight` (logo dorado) en vez del `logoDark` que se perdía; se eliminó la constante `LOGO_DARK_OVERLAY` y la variable `logoDark` (quedaban muertas).
+- Oro del panel profundizado a un degradé más rico (`#F0C959` → `gold` → `#7d5e18`).
+- `npm run typecheck` ✅.
+
+**Archivos:** `src/pages/public/AuthPage.tsx`
+
+### 5b. Login "de otro nivel" (2026-07-09) 🟡
+
+- 🌌 Aurora dorada viva en `AuthBackground` **presente también en mobile** (antes los blobs eran `hidden md:block` → mobile casi negro). Coherente con la landing sin acoplar código.
+- ✨ **Signature: border-beam** — luz dorada giratoria en el borde de la tarjeta desktop (conic-gradient rotando, tapado por el `<article>` opaco → solo se ve el borde).
+- 💛 Tarjeta mobile con borde dorado + glow suave (el beam no sirve sobre bg translúcido).
+- `npm run typecheck` ✅.
+- **Pendiente (opcional, si el cliente quiere más):** shine en botón primario, focus glow en inputs.
+
+**Archivos:** `src/pages/public/AuthPage.tsx`
+
+---
+
+## 7. Modo claro — fase 6 (cierre) 🟡
+
+**Estado:** selector publicado el 2026-09-21 (`APPEARANCE_SELECTOR_ENABLED = true` en `src/lib/theme.ts`). Oscuro sigue siendo el default.
+
+**Revisado en navegador (2026-09-19 y 2026-09-21)**, claro y oscuro:
+- Anónimo: landing completa, `/planes`, `/login`, 404; header a 320px sin choques entre logo, selector y accesos.
+- VIP: dashboard (todas las pestañas, lección, certificados) y `/vip-live`.
+- Admin: contenido, lives, métricas, usuarios, ajustes y sponsors.
+- Free (2026-09-21): módulos, lección con barra de plan gratuito, playlist, notas bloqueadas, sala de trofeos en 0/3 y Mi Panel. Se corrigió: tarjeta de módulo que en hover pasaba a gris translúcido, pistas `text-foreground-muted/50` ilegibles en claro (⇒ `light:text-fg-40`) y "Mejorar mi Plan" que parecía deshabilitado (⇒ borde dorado).
+- Individual (2026-09-21): 4 pestañas sin fondos oscuros sueltos ni scroll horizontal; lección con barra "Plan Individual", playlist, Mi Panel y modo podcast con la barra global. Con el podcast sonando, cambiar oscuro⇄claro conserva el MISMO nodo `<audio>` y la reproducción sigue (21,1 s → 22,6 s → 23,7 s).
+- Modo simple (toggle apagado) en claro, 390px: landing sin fondos oscuros; 120 textos medidos contra el marfil, el mínimo es el dorado a 5,15:1; las seis tarjetas de inteligencias en flujo normal, sin sticky. "Reducir movimiento" del SO no se emuló: por código sigue el mismo camino (`reduce = prefersReduced || !animationsEnabled` en todos los consumidores y en `MotionProvider`).
+- Dos pestañas: cambiar el tema en una lo aplica en la otra (un solo cambio de `data-theme`, sin recarga ni bucle), en ambos sentidos.
+- Editor de la landing (admin, claro): el input de edición es texto oscuro sobre marfil con caret y borde dorados (no fuerza blanco). Se corrigió: el marcador "editado sin guardar" era ámbar pálido, indistinguible del de guardado ⇒ `light:outline-warning` + tinte translúcido `light:bg-warning/[0.07]` (un fondo OPACO tapa el texto con gradiente del título, porque ese texto se pinta con el fondo del padre recortado al texto); el ícono de deshacer pasa a `light:text-warning`. La edición de prueba se deshizo sin guardar.
+- Admin: arrastre de lección en curso (elevada, sombra cálida, borde dorado; soltada sin mover ⇒ sin petición), zona de subida con archivo encima y con archivo elegido en `LessonFormSheet` (cancelado sin guardar). La barra de progreso de subida real NO se vio: solo se revisó por código (tiene overrides `light:`).
+- Voseo: el detector exigía 3 letras antes de la tilde y se le escapaban los "Usá"; corregido a 2 en `scripts/voseo-scan.mjs`, y aparecieron 4 (aria-label del reordenamiento, error de `LogoUploader`, nota y toast de `AdminLiveManager`) ⇒ "Usa".
+- Fuera del tema, en ambos temas: con la barra del podcast abierta, el lápiz de edición y "volver arriba" quedaban tapados (este último detrás: z-60 contra z-100). `GlobalPodcastPlayer` publica su altura en `--podcast-bar-h` (ResizeObserver) y los dos botones usan `bottom: calc(… + var(--podcast-bar-h, 0px))`. Verificado: con barra, lápiz y flecha terminan en 634/638 px y la barra empieza en 659 px; sin barra la variable desaparece y vuelven a 24/20 px.
+- Barrido por ancho (2026-09-21, sesión free, claro): 9 rutas públicas (`/`, `/planes`, `/historia`, `/terminos`, `/privacidad`, `/explorar/1`, `/cuenta-verificada`, `/restablecer-contrasena`, 404) en 390/768/1440 y las 4 pestañas del dashboard en 1024/1440, sin scroll horizontal ni fondos oscuros fuera de islas (script de colores calculados + revisión a ojo de `/explorar/1`). Fuera del tema, en ambos temas: el link "Volver al inicio" de `/explorar/:id` quedaba pegado al badge del módulo (dos `inline-flex` hermanos) ⇒ `flex w-fit`.
+- Link público `/live/:token` en replay: queda dentro de la isla oscura del escenario.
+- Selector: menú sólido en claro; cambiar de tema con scroll a mitad de página conserva posición, foco y la misma ventana (sin recarga).
+- Toasts success/error/info/warning con descripción y acción, legibles en ambos temas.
+- Arranque: preferencia inexistente, JSON inválido y registro viejo sin tema ⇒ oscuro, conservando animaciones/latencia.
+- Oscuro idéntico: snapshot de colores calculados antes/después (`git stash`) en rutas públicas, dashboard, `/vip-live` y 6 rutas admin; solo diferencias equivalentes (oklab vs rgba) y los envoltorios nuevos del logo.
+
+**No verificado** (queda abierto, no se da por aprobado):
+- Replay reproduciendo de verdad: en local `/api/stream/recording-url` da 502 (no corre la función de Vercel), así que solo se vio el estado de error.
+- Live en curso con la lista de conectados nueva (`LiveViewersDialog`): no había transmisión; el diálogo usa las mismas clases ya revisadas en la sala VIP.
+- Móvil horizontal y teclado móvil sobre el chat.
+
+**Reversión:** `APPEARANCE_SELECTOR_ENABLED` de vuelta a `import.meta.env.DEV` solo oculta el selector. Para devolver a todos al oscuro sin borrar preferencias, sumar `data-theme-lock="dark"` al `<html>` de `index.html`.
+
+**Archivos:** `src/lib/theme.ts`, `src/components/feature/AppearanceToggle.tsx`, `index.html`, `docs/MODO_CLARO_ESPECIFICACION.md`
+
+---
+
+## 8. Clase completa predeterminada, comunidad y calidad de emisión 🟡
+
+**Pedido del 2026-10-13:** primero documentar; en la misma fecha, implementar todo lo que no es de kbps. El código está hecho y con tests; falta la prueba con transmisión real y en dispositivos.
+
+| Prioridad | Resultado | Estado |
+|---|---|---|
+| P0 | Continuidad DVR al finalizar | 🟡 Código: el alumno de Clase completa con >45 s de atraso conserva el player al finalizar, sin recargas (con Input ID recargar trae otra emisión o un 204), con aviso y «Salir»; si el medio se traba o termina, pasa al cierre. **Falta:** probar en un vivo real y el paso automático a la grabación (necesita Video ID por emisión, no Input ID) |
+| P1 | Clase completa predeterminada, reversible | 🟢 Código: default `dvr` solo para quien no tiene modo guardado; un valor guardado se respeta. Menú «Modo de clase», ±10 s, atajos, atraso exacto (−1:35) que se actualiza en pausa, «Volver al vivo» único que respeta la pausa de sala, salida «Ver en Clase normal» si DVR falla |
+| P1 | Integridad del reproductor | 🟢 Código: sin autoplay bajo el overlay de pausa de sala al recargar; seek dentro de intervalos reales; listeners reenganchados tras «Reintentar»; menú visible en pantalla completa; resume por emisión (`id:starts_at`). **Falta:** Safari nativo sigue sin restore ni backoff (rama sin hls.js) |
+| P1 | Paridad móvil/Safari | 🔴 Sin probar en dispositivos: matriz física de `LIVE_UX_REDESIGN_AUDIT.md` |
+| P1 | Comunidad coherente en claro/oscuro | 🟢 Código: error ≠ vacío ≠ vacío por filtro, refresco sin skeleton, respuestas viejas descartadas, scroll al volver, métricas honestas, publicar bloqueado con imagen subiendo, errores en línea, menú y confirmaciones accesibles, avatar/escudo sin residuos oscuros. **Falta:** revisión visual en ambos temas con sesión real |
+| P1 | Ensayo de calidad 6000 → 8000 → 10.000 kbps | 🔴 Solo documentado, a pedido. **Verificado el 2026-10-10:** entrada de OBS en 1280×720 (nivel más alto entregado: 720p) y perfil enviando segmentos de 8,33 s (keyframe en automático, no 2 s). **Sin comprobar:** una salida de OBS en 1080p y sus resoluciones en el manifiesto; subir el bitrate sin subir la salida a 1080p rinde poco |
+
+**Plan y criterios:** [actualización de UX](./LIVE_UX_REDESIGN_AUDIT.md#actualización-2026-10-13--clase-completa-predeterminada-y-comunidad) y [guía de OBS, sección 5](./OBS_CONFIGURACION.md#5-mejor-calidad-podemos-transmitir-a-10000-kbps). 6000 es la base documentada; el perfil de OBS del 2026-10-10 no la cumplía en el keyframe. 10.000 es un ensayo viable, no una configuración aprobada ni una garantía de mayor resolución.

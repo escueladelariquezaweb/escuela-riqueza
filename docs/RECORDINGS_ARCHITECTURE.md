@@ -1,0 +1,242 @@
+# Arquitectura de Grabaciones — Archivado en R2
+
+> Cómo se almacenan las grabaciones de los lives para que el costo sea sostenible.
+> **Crítico:** leer antes de tocar `AdminLiveManager`, `VIPLiveRoom`, `api/stream/*` de grabaciones o el Worker de archivado.
+
+_Creado: 2026-07-08 · Actualizado: 2026-09-11 · Estado: 🟢 EN PRODUCCIÓN (automático) · carril largo >4 h pendiente de secrets_
+
+---
+
+## 1. El problema
+
+Cada sábado se emiten ~4 h de vivo (**~240 min**) por Cloudflare Stream. La grabación queda en Stream, y Stream cobra el **almacenamiento acumulado por mes**:
+
+- **Storage:** $5 por cada 1.000 min almacenados / mes → **nunca dejás de pagar por lo viejo**.
+- **Entrega:** $1 por cada 1.000 min entregados → cada replay que mira un VIP suma.
+
+Proyección real (~960 min nuevos/mes):
+
+| Momento | Min acumulados en Stream | Costo/mes solo storage |
+|---|---|---|
+| Mes 1 | 960 | ~$4.80 |
+| Mes 6 | 5.760 | ~$29 |
+| Mes 12 | 11.520 | ~$58 |
+| Mes 24 | 23.040 | ~$115 |
+
+El costo **crece para siempre**. Insostenible.
+
+---
+
+## 2. La solución
+
+Mover la grabación de **Cloudflare Stream** (caro, acumulativo) a **Cloudflare R2** (object storage barato, **egress cero**) apenas termina el vivo, y **borrar el video de Stream** para cortar el cobro recurrente.
+
+### Por qué R2
+- **Egress $0** → la entrega de replays no cuesta nada.
+- **Storage $0.015/GB-mes** → una grabación de 4 h (~5-8 GB) cuesta **~$0.10/mes**.
+- Mismo ecosistema Cloudflare (mismo dashboard, ya figuraba como pendiente en `CLAUDE.md`).
+
+### Comparativa de costo (1 año de sábados)
+
+| | Cloudflare Stream | Cloudflare R2 |
+|---|---|---|
+| Storage mes 12 | ~$58/mes y subiendo | **~$4.5/mes** (~300 GB) |
+| Entrega por replay masivo | $1/1000 min (paga siempre) | **$0** |
+| Tendencia | crece lineal para siempre | prácticamente plana |
+
+---
+
+## 3. Qué cambia
+
+| Capa | Antes | Después |
+|---|---|---|
+| Grabación tras el vivo | Se queda en Stream indefinidamente | Se copia a R2 y se **borra de Stream** |
+| Fuente del replay | iframe de Cloudflare Stream (`recording_stream_uid`) | MP4 en R2 vía URL firmada (`recording_r2_key`) |
+| Control de acceso | iframe público de Stream | URL firmada de vida corta, gateada por plan |
+| Costo de entrega | $1/1000 min | $0 (egress R2) |
+| Tabla `lives` | solo `recording_stream_uid` | + `recording_r2_key`, `recording_storage`, `recording_bytes`, `recording_duration_seconds`, `archived_at` |
+
+---
+
+## 4. Qué mejora
+
+- **Costo plano** en vez de curva ascendente.
+- **Entrega gratis** de replays (egress cero en R2).
+- **Tracking de minutos/costo**: al guardar `recording_bytes` y `recording_duration_seconds` podemos sumar el total y estimar gasto (resuelve de paso el punto 3 de `PENDIENTES.md`).
+- **Acceso controlado**: URL firmada de vida corta en vez de iframe público que se puede filtrar.
+
+---
+
+## 5. Cómo funciona (flujo)
+
+```
+1. Admin finaliza el vivo en AdminLiveManager
+        │
+        ▼
+2. Stream tiene la grabación (temporal). Se habilita el MP4 (POST /downloads, ya existe).
+        │
+        ▼
+3. Se dispara el archivado → Cloudflare Worker:
+     a. Espera a que el MP4 esté 'ready'.
+     b. Copia el MP4 de Stream → bucket R2 (server-to-server, dentro de Cloudflare, sin egress).
+     c. Lee duración y tamaño.
+     d. Actualiza `lives`: recording_r2_key, recording_bytes,
+        recording_duration_seconds, recording_storage='r2', archived_at.
+     e. DELETE del video en Cloudflare Stream → corta el cobro recurrente.
+        │
+        ▼
+4. Replay: VIPLiveRoom pide POST /api/stream/recording-url
+     → Vercel function valida plan del usuario
+     → genera URL firmada S3 (presigned GET, ~15 min) del objeto en R2
+     → el player reproduce el MP4.
+```
+
+### Archivado automático (Cron Trigger)
+
+El paso 3 ya **no requiere el botón manual**. El Worker tiene un **Cron Trigger** (`crons = ["*/10 * * * *"]` en `wrangler.toml` → handler `scheduled()` en `worker/src/index.ts`). Cada 10 min:
+
+1. Consulta `lives` donde `status = 'ended'`, `recording_stream_uid` está cargado y `archived_at` es null (grabado, terminado y sin archivar). Una sala en curso nunca se archiva: así no se borra de Stream una parte mientras la clase sigue transmitiendo (incidente 2026-10-10).
+   - La clave en R2 es `recordings/<liveId>/<streamVideoUid>.mp4` (única por video; Worker y Action deben coincidir, ver `worker/src/archive-helpers.ts`). Antes de subir se hace HEAD y nunca se sobrescribe un objeto existente (ni se borra de Stream en ese caso). Las filas anteriores al 2026-10-13 usan `recordings/<liveId>.mp4`; `recording-url.ts` lee la clave desde la base.
+   - **Clase partida en varias grabaciones** (OBS detenido/iniciado): solo se archiva la parte vinculada. Para la repetición completa hay que unir las partes a mano: bajarlas, recodificar a un formato único (los perfiles H.264 pueden diferir entre partes) y reconstruir el audio por parte con `aresample=async=1,apad,atrim` a la duración de su video. Verificar que la duración del audio sea igual a la del video: decodificar sin errores NO detecta audio perdido. Procedimiento usado el 2026-10-10.
+2. Corre `archiveOne()` sobre cada una — la misma lógica que el botón manual.
+3. Si el MP4 todavía se está generando, queda en `processing` y se reintenta en el próximo tick. Al archivar con éxito, `recording_stream_uid` pasa a null y la grabación deja de aparecer sola.
+
+El **botón "Archivar en R2" sigue existiendo** para forzar el archivado on-demand; el cron es la red de seguridad que lo hace solo. Ambos comparten `archiveOne()`, así que no hay lógica duplicada.
+
+**Descarte de grabaciones muertas (give-up):** una grabación que falló al codificar nunca genera MP4, así que reintentar es inútil y taparía el batch del cron. `archiveOne()` detecta dos casos y los descarta (limpia `recording_stream_uid` para que salgan del barrido):
+1. El video está en estado `error` en Stream (codificación fallida).
+2. El MP4 **ya había sido pedido en una pasada anterior**, el video tiene más de **12 h** y la generación sigue en 0% (zombi silencioso). Ojo: un MP4 recién pedido en la misma pasada **siempre** espera, sin importar la edad del video — evaluar la antigüedad ahí hacía imposible archivar cualquier grabación vieja (incidente 2026-09-07).
+
+El batch del cron está acotado (`limit=3`) para no reventar los límites de duración del Worker con grabaciones de ~3 h (varios GB); el backlog se limpia en ticks sucesivos.
+
+### Carril largo: grabaciones de más de 4 h (GitHub Actions + ffmpeg)
+
+**Cloudflare Stream no genera MP4 de grabaciones de live que superen 4 horas** (error `10047 Video Duration Too Long`; no dan excepciones). Los clips tampoco sirven: la API de clip rechaza grabaciones de live, y el "instant clipping" tiene un máximo de 60 s. Descubierto el 2026-09-11 con un vivo de 4h10m.
+
+Lo que sí está disponible es el **HLS público** de la grabación (`playback.hls` en la API, sin token). ffmpeg lo reempaqueta a MP4 **sin re-encodear** (`-c copy`) — sin pérdida de calidad, a velocidad de descarga. Un Worker no puede correr ffmpeg, así que ese trabajo vive en **GitHub Actions** (`.github/workflows/archive-long-recording.yml`): ffmpeg viene preinstalado en `ubuntu-latest`, el job tiene hasta 6 h, y no agrega infraestructura nueva.
+
+Flujo:
+1. `archiveOne()` pide el MP4 y recibe el 10047.
+2. Dispara `repository_dispatch` (`archive-long-recording`) con `live_id` y `video_uid`, y marca la sala con `archived_at` + `recording_storage = 'stream'` para que el cron **no la vuelva a intentar** ni dispare la Action 20 veces. El video sigue vinculado y reproducible por iframe mientras tanto.
+3. La Action: elige la variante de mayor resolución del manifest (sin `-map`, ffmpeg toma la primera, que es 360p) → remux → verifica que la duración del MP4 coincida (±5 s) → sube a R2 en multipart vía la API S3 → escribe en `lives` **los mismos campos que el Worker** → recién entonces borra de Stream.
+4. Al terminar, la sala queda idéntica a una archivada por el carril normal. El `RecordingPlayer` no distingue.
+
+La UI lee `archived_at` cargado + `recording_storage = 'stream'` como "supera 4 h, archivándose en segundo plano" y oculta el botón "Archivar en R2". Si la Action falla, la sala se queda así; se reintenta desde la pestaña Actions ("Run workflow" con `live_id` y `video_uid`) o con "Cambiar grabación", que limpia `archived_at`.
+
+Medido con el vivo de prueba (4h10m, 1080p): **~5.1 GB**. Un vivo por semana son ~30 min de Actions al mes.
+
+**Secrets que necesita** (GitHub → Settings → Secrets → Actions), con los mismos nombres que el `.env` del proyecto: `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_STREAM_API_TOKEN`, `VITE_SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, y `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` (R2 → *Manage R2 API Tokens*, escritura sobre `escuela-recordings`). Y en el Worker, `wrangler secret put GITHUB_TOKEN` con un token fine-grained de `contents: write` sobre este repo. Sin `GITHUB_TOKEN`, las grabaciones largas simplemente quedan en Stream con el aviso en la UI.
+
+### Por qué un Worker y no una Vercel Function para la copia
+Un MP4 de 4 h pesa varios GB. Las Vercel Functions tienen límite de tiempo (10-60s) y memoria — no pueden hacer streaming de varios GB. El **Cloudflare Worker** hace la copia Stream→R2 **dentro de la red de Cloudflare**: sin egress y sin timeout de Vercel.
+
+La **firma de URL** (paso 4) sí va en Vercel Function: es solo firmar (sin transferir datos), liviano y perfecto para serverless.
+
+### Decisión de acceso: bucket privado + URL firmada
+El contenido es VIP pago. Bucket **privado**; el frontend nunca ve la URL cruda de R2, solo una presigned URL de vida corta generada tras validar el plan. Evita que se filtren links.
+
+---
+
+## 6. Componentes nuevos
+
+| Componente | Tipo | Estado |
+|---|---|---|
+| Migración SQL (columnas nuevas en `lives`) | SQL | 🟢 corrida |
+| Tipo `LiveEvent` actualizado | TS | 🟢 |
+| `api/stream/recording-url.ts` (presigned GET, gateado por plan) | Vercel Function | 🟢 en producción |
+| `worker/` (copia Stream→R2 + borra de Stream) | Cloudflare Worker | 🟢 **deployado** |
+| `api/stream/archive-recording.ts` (dispara el Worker, modo manual) | Vercel Function | 🟢 en producción |
+| Botón "Archivar en R2" + player R2 en admin | React | 🟢 en producción |
+| **Cron Trigger** — archivado automático cada 10 min (`scheduled()`) | Cloudflare Worker | 🟢 **en producción** |
+| **Give-up** — descarta grabaciones muertas (error / 0% > 12h) | Cloudflare Worker | 🟢 en producción |
+| `scripts/configure-live-input.mjs` — setea `timeoutSeconds` | Script Node | 🟢 corrido |
+| KPI de minutos/costo en admin | React | 🔴 pendiente (los datos ya existen) |
+
+**Costo puntual a tener en cuenta:** cuando el Worker descarga el MP4 desde Stream para copiarlo a R2, esa descarga cuenta como *entrega* de Stream ($1/1000 min) — **una sola vez** por grabación (~$0.24 por un vivo de 4 h). Es despreciable frente al ahorro de storage recurrente.
+
+---
+
+## 6b. Deploy del Worker (paso a paso)
+
+Desde la carpeta `worker/`:
+
+```bash
+cd worker
+npm install
+npx wrangler login                 # abre el navegador para autorizar
+```
+
+Cargar los secrets (uno por uno; pide el valor por stdin):
+
+```bash
+npx wrangler secret put CF_ACCOUNT_ID
+npx wrangler secret put CF_STREAM_API_TOKEN
+npx wrangler secret put SUPABASE_URL
+npx wrangler secret put SUPABASE_SERVICE_ROLE_KEY
+npx wrangler secret put ARCHIVE_SHARED_SECRET   # inventá un string largo y aleatorio
+```
+
+Deploy:
+
+```bash
+npx wrangler deploy
+```
+
+`wrangler` imprime la URL del Worker (ej. `https://escuela-archive-recording.<subdominio>.workers.dev`).
+
+Después, en **Vercel → Settings → Environment Variables**:
+
+| Variable | Valor |
+|---|---|
+| `ARCHIVE_WORKER_URL` | la URL que imprimió `wrangler deploy` |
+| `ARCHIVE_SHARED_SECRET` | **el mismo** string que pusiste en el secret del Worker |
+
+Redeploy de Vercel para que tome las envs.
+
+---
+
+## 7. Qué necesito de Cloudflare (acción del cliente)
+
+Para desbloquear los componentes 🔴:
+
+1. **Crear un bucket R2** (ej. `escuela-recordings`). → Pasame el nombre.
+2. **Credenciales S3 de R2**: R2 → *Manage R2 API Tokens* → crear token con *Object Read & Write*. Devuelve:
+   - `R2_ACCESS_KEY_ID`
+   - `R2_SECRET_ACCESS_KEY`
+   - endpoint S3: `https://<ACCOUNT_ID>.r2.cloudflarestorage.com`
+   → cargar en Vercel (server-side, **sin** prefijo `VITE_`).
+3. **Confirmar que el token de Stream** (`CLOUDFLARE_STREAM_API_TOKEN`) tiene permiso de **borrado** (`Stream:Edit` lo cubre).
+4. **Deploy del Worker** (cuando lo tenga escrito): se despliega con `wrangler` y un *binding* R2 al bucket del paso 1. Te paso el `wrangler.toml` listo.
+
+Variables de entorno nuevas (Vercel):
+
+| Variable | Para qué |
+|---|---|
+| `R2_ACCESS_KEY_ID` | Firmar URLs de descarga R2 |
+| `R2_SECRET_ACCESS_KEY` | Idem (secret, nunca al cliente) |
+| `R2_ACCOUNT_ID` | Endpoint S3 de R2 |
+| `R2_BUCKET` | Nombre del bucket |
+
+---
+
+## 8. Rollout / consideraciones
+
+- **Transición suave:** `recording_storage` (`'stream' | 'r2' | null`) indica dónde vive cada grabación. Los replays viejos que aún estén en Stream siguen funcionando por `recording_stream_uid`; los nuevos van por R2. Nada se rompe de golpe.
+- **Borrado de Stream irreversible:** una vez en R2 y borrado de Stream, R2 es la única fuente. Por eso el Worker borra **solo después** de confirmar la copia exitosa en R2.
+- **Sin ABR:** R2 sirve un MP4 plano (sin bitrate adaptativo). Para replay a audiencia VIP chica, un `<video>` con range requests alcanza. Si en el futuro se necesita HLS, se agrega — hoy sería sobre-ingeniería.
+- **Grabaciones ya existentes en Stream:** se pueden migrar a R2 corriendo el Worker sobre cada `recording_stream_uid` viejo (tarea opcional posterior).
+
+---
+
+## 9. Operación y troubleshooting (streaming)
+
+La calidad de la grabación depende de cómo se emite el vivo. Aprendizajes clave (2026-07):
+
+- **Keyframe Interval = 2 en OBS (obligatorio).** En `Auto` (default), Cloudflare no puede codificar la grabación a VOD y falla con *"The video failed to be encoded due to an unknown cause"*. Solo se setea en el modo de salida **Avanzado**. La guía embebida en `AdminLiveManager` ya lo indica.
+- **`timeoutSeconds = 300` en el Live Input** (via `scripts/configure-live-input.mjs`, cuyo default es ese mismo valor). Sin esto, cada micro-corte de OBS crea un **video nuevo** en Stream → grabación fragmentada en decenas de clips. Arrancó en 60 (2026-07) y se subió a 300 el 2026-09-19 porque 60 no alcanzaba a cubrir un Stop/Start manual de OBS; verificado por API el 2026-10-10. Tradeoff: la grabación se finaliza ~5 min después de cortar el stream.
+- **Estabilidad del emisor.** La causa raíz de los cortes es el enlace OBS→Cloudflare: transmitir por **ethernet** (no WiFi) y con **bitrate ≤ 50% del upload real**. Un stream que se cae genera grabaciones con *"missing or invalid data"* que nunca codifican (y el give-up las descarta).
+
+### Síntoma → dónde mirar
+- Player con 404 en `manifest/video.mpd` / `lifecycle` + 424 en el iframe → el video **no existe / no codificó** en Stream. No es bug del frontend.
+- Finalizados vacío tras un vivo → revisar el estado del video en Cloudflare Stream (¿`error`? ¿storage lleno?).
+- Grabación no aparece en R2 tras ~20 min → `npx wrangler tail` en `worker/` para ver el log del cron (`archived` / `processing X%` / `descartada`).
